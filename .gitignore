@@ -4,6 +4,7 @@ target/
 !**/src/test/**/target/
 .idea/
 .kotlin
+.orion/
 
 .idea/modules.xml
 .idea/jarRepositories.xml
