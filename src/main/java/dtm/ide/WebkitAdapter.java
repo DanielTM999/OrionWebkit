@@ -1,26 +1,33 @@
 package dtm.ide;
 
 
+import dtm.di.annotations.Async;
 import dtm.di.annotations.Singleton;
+import dtm.ide.api.annotations.CodeFormatProprity;
 import dtm.ide.api.annotations.CooperativeAdapter;
 import dtm.ide.api.annotations.PluginReference;
 import dtm.ide.api.context.IdeProjectContext;
 import dtm.ide.api.extension.IdeAdapter;
+import dtm.ide.api.extension.menu.IdeMenuBuilder;
 import dtm.ide.api.project.editor.DocumentHighlight;
+import dtm.ide.api.project.editor.FormatCodeContext;
 import dtm.ide.api.project.editor.IdeCompletionContext;
 import dtm.ide.api.project.editor.IdeCompletionTriggerKind;
 import dtm.ide.api.project.editor.IdeDiagnosticsContext;
 import dtm.ide.api.project.editor.IdeDocumentHighlightContext;
 import dtm.ide.api.project.editor.IdeDefinitionContext;
 import dtm.ide.api.project.editor.IdeHoverContext;
+import dtm.ide.api.project.editor.IdeFormatScope;
 import dtm.ide.api.project.editor.IdeSignatureHelpContext;
 import dtm.ide.api.project.editor.IdeRenameContext;
 import dtm.ide.api.project.editor.IdeCodeActionContext;
 import dtm.ide.api.project.editor.IdeEditorContext;
 import dtm.ide.api.theme.EditorTheme;
+import dtm.ide.editor.HtmlMarkupCompletionProvider;
 import dtm.ide.editor.theme.WebkitEditorTheme;
 import dtm.ide.lsp.WebkitLspService;
 import dtm.ide.lsp.JsTsSnippets;
+import dtm.ide.ui.NewWebItemPanel;
 import dtm.ide.utils.WebkitPathConventions;
 import dtm.request_actions.http.download.core.DownloadObserver;
 import dtm.stools.component.panels.editor.code.autocomplete.AutoCompleteItem;
@@ -33,8 +40,15 @@ import dtm.stools.component.panels.editor.code.hover.HoverInfo;
 import dtm.stools.component.panels.editor.code.signature.SignatureHelp;
 import dtm.stools.component.panels.editor.code.prototype.folding.FoldRule;
 import dtm.stools.component.panels.editor.code.provider.TokenizerCodeEditorProvider;
+import dtm.stools.utils.ImageUtils;
 import lombok.extern.slf4j.Slf4j;
+import javax.swing.Icon;
 import javax.swing.SwingUtilities;
+import java.awt.Color;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Collections;
@@ -43,6 +57,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.stream.Stream;
 
 @Slf4j
 @Singleton
@@ -51,12 +66,12 @@ import java.util.concurrent.Executors;
 public class WebkitAdapter extends IdeAdapter {
 
     private static final Set<Character> DEFAULT_COMPLETION_TRIGGERS =
-            Set.of('.', '<', '/', ':', '"', '\'', '-', '@', '$');
-    
+            Set.of('.', '<', '>', '/', ':', '"', '\'', '-', '@', '$');
     private static final int HTML_CONTEXT_SCAN_WINDOW = 50_000;
 
     private final WebkitEditorRegistry editorRegistry = new WebkitEditorRegistry();
     private final EditorTheme editorTheme = new WebkitEditorTheme();
+    private final HtmlMarkupCompletionProvider htmlCompletionProvider = new HtmlMarkupCompletionProvider();
     private final ExecutorService lspSetupExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "orion-webkit-lsp-setup");
         t.setDaemon(true);
@@ -95,6 +110,68 @@ public class WebkitAdapter extends IdeAdapter {
     @Override
     public boolean handlesPath(Path path) {
         return WebkitPathConventions.isWebkitPath(path);
+    }
+
+    @Override
+    public void contributeProjectTreeMenu(IdeMenuBuilder menu, List<Path> selectedPaths) {
+        if (menu == null || selectedPaths == null || selectedPaths.size() != 1) {
+            return;
+        }
+        Path selected = selectedPaths.getFirst();
+        if (selected == null || !Files.isDirectory(selected)) {
+            return;
+        }
+        menu.into("tree.new", sub -> sub.item("Web file...", newWebItemIcon(), e -> openNewWebItem(selected)));
+    }
+
+    private Icon newWebItemIcon() {
+        return ImageUtils.getIconByResource(WebkitAdapter.class, "imgs/webNew.svg")
+                .map(icon -> ImageUtils.resizeIcon(icon, 16, 16))
+                .orElse(null);
+    }
+
+    private void openNewWebItem(Path directory) {
+        Runnable showDialog = () -> {
+            NewWebItemPanel panel = new NewWebItemPanel();
+            NewWebItemPanel.Result result = createModernComponentDialogBuilder(NewWebItemPanel.Result.class)
+                    .title("New web file")
+                    .draggable(true)
+                    .showIcon(false)
+                    .accentColor(new Color(59, 130, 246))
+                    .confirmText("Create")
+                    .cancelText("Cancel")
+                    .enterConfirms(true)
+                    .component(panel)
+                    .result(ctx -> panel.getResult())
+                    .show();
+            if (result != null) {
+                createWebFile(directory, result);
+            }
+        };
+        if (SwingUtilities.isEventDispatchThread()) {
+            showDialog.run();
+        } else {
+            SwingUtilities.invokeLater(showDialog);
+        }
+    }
+
+    private void createWebFile(Path directory, NewWebItemPanel.Result result) {
+        String fileName = result.kind().fileName(result.name());
+        Path file = directory.resolve(fileName);
+        if (Files.exists(file)) {
+            setStatusBarText("Already exists " + file.getFileName());
+            requestOpenFile(file);
+            return;
+        }
+        try {
+            Files.writeString(file, result.kind().template(result.name()), StandardCharsets.UTF_8);
+            requestProjectTreeViewRefresh();
+            requestOpenFile(file);
+            setStatusBarText("Created " + file.getFileName());
+        } catch (Exception e) {
+            setStatusBarText("Failed to create web file: " + e.getMessage());
+            log.warn("Failed to create web file {}", file, e);
+        }
     }
 
     @Override
@@ -176,21 +253,34 @@ public class WebkitAdapter extends IdeAdapter {
         }
         String prefix = completionPrefix(context);
         boolean javascriptContext = isJavaScriptCompletionContext(context);
+        List<AutoCompleteItem> pathItems = WebkitPathConventions.isHtmlLike(context.filePath())
+                ? htmlPathCompletionItems(context)
+                : List.of();
+        if (insideHtmlAttributeValue(context.text(), context.caretOffset())) {
+            // Paths are completed locally and only when explicitly requested. This keeps ./, ../ and
+            // the portion already typed intact instead of letting a generic completion replace it.
+            return pathItems;
+        }
+        List<AutoCompleteItem> htmlItems = WebkitPathConventions.isHtmlLike(context.filePath())
+                ? htmlCompletionProvider.suggestions(context.text(), context.caretOffset(),
+                context.triggerKind() != IdeCompletionTriggerKind.TYPING)
+                : List.of();
         List<AutoCompleteItem> snippets = javascriptContext ? JsTsSnippets.matching(prefix) : List.of();
         WebkitLspService service = lspService;
         if (service == null) {
-            return snippets;
+            return mergeCompletionItems(htmlItems, snippets);
         }
         Path file = WebkitPathConventions.normalizePath(context.filePath());
         if (!service.isRunningFor(file)) {
             startLanguageServerFor(file, context.text());
-            return snippets;
+            return mergeCompletionItems(htmlItems, snippets);
         }
         List<AutoCompleteItem> lspItems = service.complete(file, context.text(), context.caretLine(), context.caretCol(), prefix, triggerCharacterOf(context));
         if (!javascriptContext) {
-            return lspItems;
+            return mergeCompletionItems(htmlItems, lspItems);
         }
-        List<AutoCompleteItem> out = new java.util.ArrayList<>(lspItems.size() + snippets.size());
+        List<AutoCompleteItem> out = new java.util.ArrayList<>(lspItems.size() + snippets.size() + htmlItems.size());
+        out.addAll(htmlItems);
         if (JsTsSnippets.isExactTrigger(prefix)) {
             out.addAll(snippets);
             out.addAll(lspItems);
@@ -199,6 +289,67 @@ public class WebkitAdapter extends IdeAdapter {
             out.addAll(snippets);
         }
         return out;
+    }
+
+    private static List<AutoCompleteItem> mergeCompletionItems(List<AutoCompleteItem> first,
+                                                                 List<AutoCompleteItem> second) {
+        if (first.isEmpty()) return second;
+        if (second.isEmpty()) return first;
+        List<AutoCompleteItem> merged = new java.util.ArrayList<>(first.size() + second.size());
+        merged.addAll(first);
+        merged.addAll(second);
+        return merged;
+    }
+
+    private static List<AutoCompleteItem> htmlPathCompletionItems(IdeCompletionContext context) {
+        if (context.triggerKind() == IdeCompletionTriggerKind.TYPING) {
+            return List.of();
+        }
+        String typedPath = htmlAttributePathPrefix(context.text(), context.caretOffset());
+        Path currentFile = context.filePath();
+        if (typedPath == null || currentFile == null || currentFile.getParent() == null) {
+            return List.of();
+        }
+        Path base = currentFile.toAbsolutePath().normalize().getParent();
+        String normalized = typedPath.replace('\\', '/');
+        if (normalized.matches("^[A-Za-z][A-Za-z0-9+.-]*:.*") || normalized.startsWith("//")) {
+            return List.of(); // http:, https:, data: and protocol-relative URLs are not local paths.
+        }
+        boolean startsFromCurrentDirectory = normalized.isEmpty();
+        int slash = normalized.lastIndexOf('/');
+        String folderPart = slash < 0 ? "" : normalized.substring(0, slash + 1);
+        String namePart = slash < 0 ? normalized : normalized.substring(slash + 1);
+        String relativeFolder = folderPart;
+        while (relativeFolder.startsWith("./")) {
+            relativeFolder = relativeFolder.substring(2);
+        }
+        Path folder;
+        try {
+            folder = base.resolve(relativeFolder.replace('/', java.io.File.separatorChar)).normalize();
+        } catch (InvalidPathException e) {
+            return List.of();
+        }
+        if (!folder.startsWith(base) || !Files.isDirectory(folder)) {
+            return List.of();
+        }
+        try (Stream<Path> files = Files.list(folder)) {
+            return files
+                    .filter(path -> path.getFileName() != null)
+                    .filter(path -> path.getFileName().toString().startsWith(namePart))
+                    .sorted()
+                    .limit(100)
+                    .map(path -> {
+                        String suffix = path.getFileName() + (Files.isDirectory(path) ? "/" : "");
+                        String candidate = (startsFromCurrentDirectory ? "./" : folderPart) + suffix;
+                        // The editor preserves the portion before the current file-name prefix.
+                        // Insert only the missing suffix to avoid turning ./index.js into ././index.js.
+                        String insert = startsFromCurrentDirectory ? "./" + suffix : suffix;
+                        return new AutoCompleteItem(insert, candidate, Files.isDirectory(path) ? "folder" : "file");
+                    })
+                    .toList();
+        } catch (IOException e) {
+            return List.of();
+        }
     }
 
     private static boolean isJavaScriptCompletionContext(IdeCompletionContext context) {
@@ -333,14 +484,17 @@ public class WebkitAdapter extends IdeAdapter {
     }
 
     private static boolean isCompletionChar(char typed) {
-        return Character.isLetter(typed) || typed == '.' || typed == '<' || typed == '/' || typed == ':'
+        return Character.isLetter(typed) || typed == '.' || typed == '<' || typed == '>' || typed == '/' || typed == ':'
                 || typed == '"' || typed == '\'' || typed == '-' || typed == '_'
                 || typed == '@' || typed == '#' || typed == '$' || typed == '&';
     }
 
 
     private static boolean htmlWantsCompletion(IdeCompletionContext context, char typed) {
-        if (typed == '<' || typed == '/' || typed == '&' || typed == '"' || typed == '\'' || typed == ':') {
+        if (insideHtmlAttributeValue(context.text(), context.caretOffset())) {
+            return false;
+        }
+        if (typed == '<' || typed == '>' || typed == '/' || typed == '&' || typed == '"' || typed == '\'' || typed == ':') {
             return true;
         }
         if (!isCompletionChar(typed)) {
@@ -351,7 +505,163 @@ public class WebkitAdapter extends IdeAdapter {
         if (text == null || offset <= 0) {
             return false;
         }
-        return insideTag(text, offset) || insideEmbeddedBlock(text, offset);
+        return insideTag(text, offset) || insideEmbeddedBlock(text, offset) || isBlankLineTagPrefix(context);
+    }
+
+    private static boolean isBlankLineTagPrefix(IdeCompletionContext context) {
+        String line = context.currentLine();
+        int col = context.caretCol();
+        if (line == null || col <= 0 || col > line.length()) {
+            return false;
+        }
+        return line.substring(0, col).trim().matches("[A-Za-z][A-Za-z0-9-]*");
+    }
+
+    private static boolean insideHtmlAttributeValue(String text, int offset) {
+        if (text == null || offset <= 0) {
+            return false;
+        }
+        int end = Math.min(offset, text.length());
+        int tagStart = text.lastIndexOf('<', end - 1);
+        if (tagStart < 0 || text.lastIndexOf('>', end - 1) > tagStart) {
+            return false;
+        }
+        char quote = 0;
+        for (int i = tagStart + 1; i < end; i++) {
+            char c = text.charAt(i);
+            if (quote == 0 && (c == '\'' || c == '"')) {
+                quote = c;
+            } else if (quote == c) {
+                quote = 0;
+            }
+        }
+        return quote != 0;
+    }
+
+    private static String htmlAttributePathPrefix(String text, int offset) {
+        if (!insideHtmlAttributeValue(text, offset) || text == null) {
+            return null;
+        }
+        int end = Math.min(offset, text.length());
+        int tagStart = text.lastIndexOf('<', end - 1);
+        String tag = text.substring(tagStart + 1, end);
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("(?is)(?:src|href)\\s*=\\s*(['\\\"])([^'\\\"]*)$")
+                .matcher(tag);
+        return matcher.find() ? matcher.group(2) : null;
+    }
+
+    @Override
+    @CodeFormatProprity(Integer.MAX_VALUE)
+    public String formatCode(FormatCodeContext context) {
+        if (context == null || context.file() == null || !WebkitPathConventions.isHighlightable(context.file())) {
+            return context == null ? null : context.text();
+        }
+        String source = context.formatScope() == IdeFormatScope.SELECTION
+                ? context.text()
+                : (context.fullText() == null ? context.text() : context.fullText());
+        int tabSize = Math.max(1, context.tabSize());
+        if (WebkitPathConventions.isHtmlLike(context.file())) {
+            return formatHtml(source, tabSize, context.useSpacesForTab());
+        }
+        if (WebkitPathConventions.isJsLike(context.file())) {
+            return formatJavaScript(source, tabSize, context.useSpacesForTab());
+        }
+        return source;
+    }
+
+    private static String formatJavaScript(String source, int tabSize, boolean useSpaces) {
+        if (source == null || source.isBlank()) {
+            return source;
+        }
+        String indentUnit = useSpaces ? " ".repeat(tabSize) : "\t";
+        String[] lines = source.replace("\r\n", "\n").replace('\r', '\n').split("\n", -1);
+        StringBuilder formatted = new StringBuilder(source.length());
+        int depth = 0;
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                formatted.append('\n');
+                continue;
+            }
+            int lineDepth = Math.max(0, depth - leadingClosingBraces(trimmed));
+            formatted.append(indentUnit.repeat(lineDepth)).append(trimmed).append('\n');
+            depth = Math.max(0, depth + braceBalance(trimmed));
+        }
+        return formatted.toString();
+    }
+
+    private static int braceBalance(String text) {
+        int balance = 0;
+        char quote = 0;
+        boolean escaped = false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (quote != 0) {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == quote) quote = 0;
+                continue;
+            }
+            if (c == '\'' || c == '"' || c == '`') quote = c;
+            else if (c == '{') balance++;
+            else if (c == '}') balance--;
+        }
+        return balance;
+    }
+
+    private static int leadingClosingBraces(String text) {
+        int count = 0;
+        while (count < text.length() && text.charAt(count) == '}') count++;
+        return count;
+    }
+
+    private static String formatHtml(String source, int tabSize, boolean useSpaces) {
+        if (source == null || source.isBlank()) {
+            return source;
+        }
+        String indentUnit = useSpaces ? " ".repeat(tabSize) : "\t";
+        String[] lines = source.replace("\r\n", "\n").replace('\r', '\n').split("\n", -1);
+        StringBuilder formatted = new StringBuilder(source.length());
+        int depth = 0;
+        boolean multilineTag = false;
+        String multilineTagName = "";
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                formatted.append('\n');
+                continue;
+            }
+            boolean closing = trimmed.startsWith("</");
+            if (closing) depth = Math.max(0, depth - 1);
+            int lineDepth = multilineTag && !trimmed.equals(">") && !trimmed.endsWith(">") ? depth + 1 : depth;
+            formatted.append(indentUnit.repeat(Math.max(0, lineDepth))).append(trimmed).append('\n');
+
+            if (trimmed.startsWith("<") && !closing && !trimmed.startsWith("<!--")) {
+                String tag = htmlTagName(trimmed);
+                boolean complete = trimmed.endsWith(">") && !trimmed.endsWith("/>");
+                if (complete && !isVoidHtmlTag(tag) && !trimmed.contains("</")) depth++;
+                multilineTag = !trimmed.endsWith(">");
+                if (multilineTag) multilineTagName = tag;
+            }
+            if (multilineTag && trimmed.endsWith(">")) {
+                if (!isVoidHtmlTag(multilineTagName) && !trimmed.endsWith("/>")) depth++;
+                multilineTag = false;
+                multilineTagName = "";
+            }
+        }
+        return formatted.toString();
+    }
+
+    private static String htmlTagName(String value) {
+        int start = value.startsWith("</") ? 2 : (value.startsWith("<") ? 1 : 0);
+        int end = start;
+        while (end < value.length() && (Character.isLetterOrDigit(value.charAt(end)) || value.charAt(end) == '-')) end++;
+        return value.substring(start, end).toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private static boolean isVoidHtmlTag(String tag) {
+        return Set.of("area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr").contains(tag);
     }
 
     private static boolean insideTag(String text, int offset) {
