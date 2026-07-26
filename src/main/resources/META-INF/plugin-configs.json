@@ -3,7 +3,7 @@
     "dtm.ide"
   ],
   "pluginCollectionId": "orion-webtoolkit-support",
-  "pluginCollectionName": ".NET / C# Orion Support",
+  "pluginCollectionName": "Orion Web devkit",
   "pluginCollectionVersion": "1.0.0",
   "pluginCollectionDescription": "Suporte ao desenvolvimento Web na Orion IDE.",
   "pluginCollectionAuthor": "DanielTM999",
