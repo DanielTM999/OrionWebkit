@@ -22,11 +22,14 @@ import dtm.ide.api.project.editor.IdeSignatureHelpContext;
 import dtm.ide.api.project.editor.IdeRenameContext;
 import dtm.ide.api.project.editor.IdeCodeActionContext;
 import dtm.ide.api.project.editor.IdeEditorContext;
+import dtm.ide.api.project.editor.IdeWordClickContext;
 import dtm.ide.api.theme.EditorTheme;
 import dtm.ide.editor.HtmlMarkupCompletionProvider;
 import dtm.ide.editor.theme.WebkitEditorTheme;
 import dtm.ide.lsp.WebkitLspService;
 import dtm.ide.lsp.JsTsSnippets;
+import dtm.ide.navigation.JavaScriptNavigationIndex;
+import dtm.ide.navigation.WebkitNavigationPopup;
 import dtm.ide.ui.NewWebItemPanel;
 import dtm.ide.utils.WebkitPathConventions;
 import dtm.request_actions.http.download.core.DownloadObserver;
@@ -46,14 +49,18 @@ import javax.swing.Icon;
 import javax.swing.SwingUtilities;
 import java.awt.Color;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -371,10 +378,276 @@ public class WebkitAdapter extends IdeAdapter {
         return locations(context, true);
     }
 
+    @Override
+    public void onWordClick(IdeWordClickContext context) {
+        if (context == null || context.filePath() == null
+                || !WebkitPathConventions.isJsLike(context.filePath())) {
+            return;
+        }
+        Thread.ofVirtual().name("orion-webkit-navigation").start(() -> {
+            List<Location> currentFileDefinitions = JavaScriptNavigationIndex.findDefinitions(
+                    null,
+                    context.filePath(),
+                    context.text(),
+                    context.word()
+            );
+            boolean declarationClick = JavaScriptNavigationIndex.isDeclarationAt(
+                    context.text(),
+                    context.word(),
+                    context.startOffset()
+            ) || currentFileDefinitions.stream().anyMatch(location ->
+                    pointsToClick(location, context.filePath(), context.line(), context.col()));
+
+            if (declarationClick) {
+                List<Location> references = JavaScriptNavigationIndex.findReferences(
+                        projectPath,
+                        context.filePath(),
+                        context.text(),
+                        context.word()
+                );
+                references = withoutDefinitions(
+                        references, currentFileDefinitions, context.filePath());
+                if (references.isEmpty()) {
+                    setStatusBarText("JavaScript: no usages found");
+                    return;
+                }
+                showUsageTargets(
+                        references,
+                        context.filePath(),
+                        context.text(),
+                        context.editorContext(),
+                        context.word()
+                );
+                return;
+            }
+
+            if (!currentFileDefinitions.isEmpty()) {
+                openDefinitionTargets(currentFileDefinitions, context);
+                return;
+            }
+
+            IdeDefinitionContext request = new IdeDefinitionContext(
+                    context.text(),
+                    context.filePath(),
+                    context.line(),
+                    context.col(),
+                    context.startOffset()
+            );
+            List<Location> definitions = findDefinitions(request);
+            if (definitions.isEmpty()) {
+                definitions = JavaScriptNavigationIndex.findDefinitions(
+                        projectPath,
+                        context.filePath(),
+                        context.text(),
+                        context.word()
+                );
+            }
+            if (definitions.isEmpty()) {
+                setStatusBarText("JavaScript: definition not found");
+                return;
+            }
+            openDefinitionTargets(definitions, context);
+        });
+    }
+
+    private void openDefinitionTargets(List<Location> definitions,
+                                       IdeWordClickContext context) {
+            if (definitions.size() == 1) {
+                openLocation(definitions.getFirst(), context.filePath(), context.editorContext());
+                return;
+            }
+            showDefinitionTargets(
+                    definitions,
+                    context.filePath(),
+                    context.text(),
+                    context.editorContext(),
+                    context.word()
+            );
+    }
+
+    private static boolean pointsToClick(Location location, Path sourceFile, int line, int col) {
+        if (location == null || location.range() == null || location.range().start() == null) {
+            return false;
+        }
+        Path target = location.isLocal() ? sourceFile : pathFromUri(location.uri());
+        if (target == null || sourceFile == null
+                || !target.toAbsolutePath().normalize()
+                .equals(sourceFile.toAbsolutePath().normalize())) {
+            return false;
+        }
+        return location.range().start().line() == line
+                && location.range().start().col() == col;
+    }
+
+    private static List<Location> withoutDefinitions(List<Location> references,
+                                                     List<Location> definitions,
+                                                     Path sourceFile) {
+        Set<String> declarationKeys = new HashSet<>();
+        if (definitions != null) {
+            definitions.stream()
+                    .filter(java.util.Objects::nonNull)
+                    .map(location -> locationKey(location, sourceFile))
+                    .forEach(declarationKeys::add);
+        }
+        return references.stream()
+                .filter(location -> !declarationKeys.contains(locationKey(location, sourceFile)))
+                .toList();
+    }
+
+    private static String locationKey(Location location, Path sourceFile) {
+        if (location == null || location.range() == null || location.range().start() == null) {
+            return "";
+        }
+        Path path = location.isLocal() ? sourceFile : pathFromUri(location.uri());
+        String target = path == null
+                ? String.valueOf(location.uri())
+                : path.toAbsolutePath().normalize().toString().toLowerCase(java.util.Locale.ROOT);
+        return target + ':'
+                + location.range().start().line() + ':'
+                + location.range().start().col();
+    }
+
     private List<Location> locations(IdeDefinitionContext context, boolean references) {
         if (context == null || context.filePath() == null || !WebkitPathConventions.isHighlightable(context.filePath())) return List.of();
         WebkitLspService service = lspService;
         return service == null ? List.of() : service.definitions(WebkitPathConventions.normalizePath(context.filePath()), context.text(), context.line(), context.col(), references);
+    }
+
+    private void showDefinitionTargets(List<Location> targets,
+                                       Path sourceFile,
+                                       String sourceText,
+                                       IdeEditorContext sourceEditor,
+                                       String symbol) {
+        List<WebkitNavigationPopup.Item> items =
+                buildNavigationItems(targets, sourceFile, sourceText, sourceEditor);
+        if (items.isEmpty()) {
+            return;
+        }
+        String header = items.size() + " definitions"
+                + (symbol == null || symbol.isBlank() ? "" : " of " + symbol);
+        WebkitNavigationPopup.show(null, null, header, items);
+    }
+
+    private void showUsageTargets(List<Location> targets,
+                                  Path sourceFile,
+                                  String sourceText,
+                                  IdeEditorContext sourceEditor,
+                                  String symbol) {
+        List<WebkitNavigationPopup.Item> items =
+                buildNavigationItems(targets, sourceFile, sourceText, sourceEditor);
+        if (items.isEmpty()) {
+            return;
+        }
+        String header = items.size() + (items.size() == 1 ? " usage" : " usages")
+                + (symbol == null || symbol.isBlank() ? "" : " of " + symbol);
+        WebkitNavigationPopup.show(null, null, header, items);
+    }
+
+    private List<WebkitNavigationPopup.Item> buildNavigationItems(
+            List<Location> locations,
+            Path sourceFile,
+            String sourceText,
+            IdeEditorContext sourceEditor) {
+        List<WebkitNavigationPopup.Item> items = new ArrayList<>();
+        Map<Path, List<String>> cache = new HashMap<>();
+        Path root = projectPath == null ? null : projectPath.toAbsolutePath().normalize();
+        for (Location location : locations) {
+            if (location == null || location.range() == null
+                    || location.range().start() == null) {
+                continue;
+            }
+            Path path = location.isLocal() ? sourceFile : pathFromUri(location.uri());
+            if (path == null || !Files.isRegularFile(path)) {
+                continue;
+            }
+            Path normalized = path.toAbsolutePath().normalize();
+            int line = location.range().start().line();
+            String snippet = sourceLine(normalized, sourceFile, sourceText, line, cache);
+            Path shown = root != null && normalized.startsWith(root)
+                    ? root.relativize(normalized)
+                    : normalized.getFileName();
+            String display = (shown == null ? normalized : shown).toString() + ":" + (line + 1);
+            boolean currentFile = sourceFile != null
+                    && normalized.equals(sourceFile.toAbsolutePath().normalize());
+            items.add(new WebkitNavigationPopup.Item(
+                    snippet,
+                    display,
+                    currentFile,
+                    () -> openLocation(location, sourceFile, sourceEditor)
+            ));
+        }
+        return List.copyOf(items);
+    }
+
+    private void openLocation(Location location, Path sourceFile, IdeEditorContext sourceEditor) {
+        if (location == null || location.range() == null || location.range().start() == null) {
+            return;
+        }
+        int line = location.range().start().line();
+        int col = location.range().start().col();
+        Path target = location.isLocal() ? sourceFile : pathFromUri(location.uri());
+        if (target == null || !Files.isRegularFile(target)) {
+            setStatusBarText("JavaScript: definition file not found");
+            return;
+        }
+        Path normalizedTarget = target.toAbsolutePath().normalize();
+        Path normalizedSource = sourceFile == null
+                ? null
+                : sourceFile.toAbsolutePath().normalize();
+        SwingUtilities.invokeLater(() -> {
+            if (normalizedTarget.equals(normalizedSource) && sourceEditor != null) {
+                sourceEditor.setCaretPosition(line, col);
+                return;
+            }
+            requestOpenFile(normalizedTarget);
+            SwingUtilities.invokeLater(() -> setCaretPosition(line, col));
+        });
+    }
+
+    private static Path pathFromUri(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            URI uri = URI.create(value);
+            if (uri.getScheme() == null || uri.getScheme().isBlank()) {
+                return Path.of(value).toAbsolutePath().normalize();
+            }
+            if ("file".equalsIgnoreCase(uri.getScheme())) {
+                return Path.of(uri).toAbsolutePath().normalize();
+            }
+        } catch (Exception ignored) {
+            try {
+                return Path.of(value).toAbsolutePath().normalize();
+            } catch (Exception ignoredAgain) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static String sourceLine(Path file,
+                                     Path currentFile,
+                                     String currentText,
+                                     int line,
+                                     Map<Path, List<String>> cache) {
+        if (line < 0) {
+            return "";
+        }
+        List<String> lines;
+        if (currentText != null && currentFile != null
+                && file.equals(currentFile.toAbsolutePath().normalize())) {
+            lines = currentText.lines().toList();
+        } else {
+            lines = cache.computeIfAbsent(file, key -> {
+                try {
+                    return Files.readAllLines(key);
+                } catch (Exception ignored) {
+                    return List.of();
+                }
+            });
+        }
+        return line < lines.size() ? lines.get(line).strip() : "";
     }
 
     @Override
