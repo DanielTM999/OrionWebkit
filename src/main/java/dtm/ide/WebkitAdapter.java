@@ -72,8 +72,7 @@ import java.util.stream.Stream;
 @PluginReference(id = "orion-webkit-adapter")
 public class WebkitAdapter extends IdeAdapter {
 
-    private static final Set<Character> DEFAULT_COMPLETION_TRIGGERS =
-            Set.of('.', '<', '>', '/', ':', '"', '\'', '-', '@', '$');
+    private static final Set<Character> DEFAULT_COMPLETION_TRIGGERS = Set.of('.', '<', '>', '/', ':', '"', '\'', '-', '@', '$');
     private static final int HTML_CONTEXT_SCAN_WINDOW = 50_000;
 
     private final WebkitEditorRegistry editorRegistry = new WebkitEditorRegistry();
@@ -757,7 +756,7 @@ public class WebkitAdapter extends IdeAdapter {
     }
 
     private static boolean isCompletionChar(char typed) {
-        return Character.isLetter(typed) || typed == '.' || typed == '<' || typed == '>' || typed == '/' || typed == ':'
+        return typed == '.' || typed == '<' || typed == '>' || typed == '/' || typed == ':'
                 || typed == '"' || typed == '\'' || typed == '-' || typed == '_'
                 || typed == '@' || typed == '#' || typed == '$' || typed == '&';
     }
