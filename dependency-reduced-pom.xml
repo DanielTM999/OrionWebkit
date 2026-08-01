@@ -131,6 +131,14 @@
       </plugin>
     </plugins>
   </build>
+  <dependencies>
+    <dependency>
+      <groupId>dtm.ide</groupId>
+      <artifactId>OrionApi</artifactId>
+      <version>1.0.0</version>
+      <scope>provided</scope>
+    </dependency>
+  </dependencies>
   <properties>
     <apache.compress.version>1.26.2</apache.compress.version>
     <maven.compiler.target>25</maven.compiler.target>

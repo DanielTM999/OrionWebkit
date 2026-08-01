@@ -115,9 +115,7 @@ public class JsTokenizerProvider implements TokenizerCodeEditorProvider {
             }
 
             if (c == '`') {
-                int start = i;
-                i = scanTemplateLiteral(text, i, to);
-                tokens.add(new LexToken(start, i, TokenType.STRING, text));
+                i = lexTemplateLiteral(text, i, to, tokens);
                 continue;
             }
 
@@ -175,7 +173,101 @@ public class JsTokenizerProvider implements TokenizerCodeEditorProvider {
         return i;
     }
 
-    private static int scanTemplateLiteral(String text, int start, int to) {
+    /**
+     * Lexes a template literal starting at the opening backtick, emitting separate
+     * tokens so it renders like VS Code: STRING for the literal text (and backticks),
+     * SYMBOL for the {@code ${} and} {@code }} delimiters, and regular code tokens
+     * for the expression inside each {@code ${...}} interpolation.
+     *
+     * @return the index just past the template literal.
+     */
+    private static int lexTemplateLiteral(String text, int start, int to, List<LexToken> tokens) {
+        int i = start + 1;
+        int textStart = start;
+        while (i < to) {
+            char c = text.charAt(i);
+            if (c == '\\' && i + 1 < to) {
+                i += 2;
+                continue;
+            }
+            if (c == '`') {
+                i++;
+                tokens.add(new LexToken(textStart, i, TokenType.STRING, text));
+                return i;
+            }
+            if (c == '$' && i + 1 < to && text.charAt(i + 1) == '{') {
+                if (i > textStart) {
+                    tokens.add(new LexToken(textStart, i, TokenType.STRING, text));
+                }
+                tokens.add(new LexToken(i, i + 2, TokenType.SYMBOL, text));
+                int exprStart = i + 2;
+                int exprEnd = findMatchingBrace(text, exprStart, to);
+                tokens.addAll(lex(text, exprStart, exprEnd));
+                if (exprEnd < to && text.charAt(exprEnd) == '}') {
+                    tokens.add(new LexToken(exprEnd, exprEnd + 1, TokenType.SYMBOL, text));
+                    i = exprEnd + 1;
+                } else {
+                    i = exprEnd;
+                }
+                textStart = i;
+                continue;
+            }
+            i++;
+        }
+        if (i > textStart) {
+            tokens.add(new LexToken(textStart, i, TokenType.STRING, text));
+        }
+        return i;
+    }
+
+    /**
+     * Finds the index of the {@code }} that closes an interpolation opened by
+     * {@code ${}, starting scanning at} {@code i} with brace depth 1. Braces inside
+     * strings, comments and nested template literals are ignored. Returns {@code to}
+     * if unterminated.
+     */
+    private static int findMatchingBrace(String text, int i, int to) {
+        int depth = 1;
+        while (i < to) {
+            char c = text.charAt(i);
+            if (c == '`') {
+                i = skipTemplateLiteral(text, i, to);
+                continue;
+            }
+            if (c == '"' || c == '\'') {
+                i = scanString(text, i, c, to);
+                continue;
+            }
+            if (c == '/' && i + 1 < to && text.charAt(i + 1) == '/') {
+                i += 2;
+                while (i < to && text.charAt(i) != '\r' && text.charAt(i) != '\n') {
+                    i++;
+                }
+                continue;
+            }
+            if (c == '/' && i + 1 < to && text.charAt(i + 1) == '*') {
+                int end = text.indexOf("*/", i + 2);
+                i = end < 0 || end >= to ? to : end + 2;
+                continue;
+            }
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+            }
+            i++;
+        }
+        return i;
+    }
+
+    /**
+     * Skips over a nested template literal (starting at its opening backtick),
+     * correctly stepping over its own interpolations. Returns the index just past it.
+     */
+    private static int skipTemplateLiteral(String text, int start, int to) {
         int i = start + 1;
         while (i < to) {
             char c = text.charAt(i);
@@ -187,17 +279,8 @@ public class JsTokenizerProvider implements TokenizerCodeEditorProvider {
                 return i + 1;
             }
             if (c == '$' && i + 1 < to && text.charAt(i + 1) == '{') {
-                int depth = 1;
-                i += 2;
-                while (i < to && depth > 0) {
-                    char inner = text.charAt(i);
-                    if (inner == '{') {
-                        depth++;
-                    } else if (inner == '}') {
-                        depth--;
-                    }
-                    i++;
-                }
+                int exprEnd = findMatchingBrace(text, i + 2, to);
+                i = exprEnd < to && text.charAt(exprEnd) == '}' ? exprEnd + 1 : exprEnd;
                 continue;
             }
             i++;
