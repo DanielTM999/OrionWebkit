@@ -28,6 +28,9 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 
@@ -42,6 +45,9 @@ public final class WebkitLspProcess {
     private static final long INITIALIZE_TIMEOUT_MS = 20_000;
     private static final long SHUTDOWN_TIMEOUT_MS = 2_000;
     private static final long COMPLETION_TIMEOUT_MS = 3_000;
+    private static final long HEALTH_CHECK_TIMEOUT_MS = 2_000;
+    private static final long DIAGNOSTICS_STALL_TIMEOUT_SECONDS = 30;
+    private static final int UNRESPONSIVE_TIMEOUT_THRESHOLD = 2;
     
     private static final long RESOLVE_BUDGET_MS = 1_500;
     private static final int MAX_COMPLETION_ITEMS = 200;
@@ -54,7 +60,11 @@ public final class WebkitLspProcess {
 
     private final LspServerKind kind;
     private final Consumer<String> onDiagnosticsPublished;
+    private final Consumer<LspServerKind> onRecoveryRequired;
     private final Object lock = new Object();
+    private final AtomicInteger consecutiveRequestTimeouts = new AtomicInteger();
+    private final AtomicInteger consecutiveHealthCheckTimeouts = new AtomicInteger();
+    private final AtomicBoolean recoverySignalled = new AtomicBoolean();
 
     private volatile Process process;
     private volatile WebkitLspJsonRpcClient client;
@@ -68,10 +78,14 @@ public final class WebkitLspProcess {
     private final Map<String, Integer> documentVersions = new ConcurrentHashMap<>();
     private final Map<String, String> lastSyncedText = new ConcurrentHashMap<>();
     private final Map<String, List<JsonNode>> diagnosticsByUri = new ConcurrentHashMap<>();
+    private final Map<String, Long> diagnosticsPendingSince = new ConcurrentHashMap<>();
 
-    public WebkitLspProcess(LspServerKind kind, Consumer<String> onDiagnosticsPublished) {
+    public WebkitLspProcess(LspServerKind kind,
+                            Consumer<String> onDiagnosticsPublished,
+                            Consumer<LspServerKind> onRecoveryRequired) {
         this.kind = kind;
         this.onDiagnosticsPublished = onDiagnosticsPublished;
+        this.onRecoveryRequired = onRecoveryRequired;
     }
 
     public LspServerKind kind() {
@@ -96,6 +110,10 @@ public final class WebkitLspProcess {
             if (isRunning()) {
                 return;
             }
+            if (client != null || process != null) {
+                stopInternal();
+            }
+            recoverySignalled.set(false);
             state = State.STARTING;
             try {
                 ProcessBuilder builder = new ProcessBuilder(command);
@@ -105,6 +123,7 @@ public final class WebkitLspProcess {
                 Process started = builder.start();
                 process = started;
                 drainStderrQuietly(started);
+                started.onExit().thenRun(() -> onUnexpectedExit(started));
 
                 WebkitLspJsonRpcClient rpc = new WebkitLspJsonRpcClient(started.getInputStream(), started.getOutputStream());
                 rpc.onNotification("textDocument/publishDiagnostics", this::onPublishDiagnostics);
@@ -115,12 +134,17 @@ public final class WebkitLspProcess {
 
                 handshake(rpc, rootPath, initializationOptions);
                 state = State.RUNNING;
+                lastError = null;
+                consecutiveRequestTimeouts.set(0);
+                consecutiveHealthCheckTimeouts.set(0);
+                recoverySignalled.set(false);
                 log.info("Servidor de linguagem {} iniciado (pid {}).", kind, started.pid());
             } catch (Exception e) {
                 lastError = e.getMessage();
-                state = State.ERROR;
                 log.warn("Falha ao iniciar o servidor de linguagem {}: {}", kind, e.getMessage());
                 stopInternal();
+                state = State.ERROR;
+                signalRecoveryRequired();
             }
         }
     }
@@ -221,8 +245,17 @@ public final class WebkitLspProcess {
         Map<String, Object> params = new HashMap<>(extra);
         params.put("textDocument", Map.of("uri", toUri(file)));
         params.put("position", Map.of("line", line, "character", character));
-        try { return client.sendRequest(method, params).get(3, TimeUnit.SECONDS); }
-        catch (Exception e) { log.debug("Falha LSP {}: {}", method, e.getMessage()); return null; }
+        try {
+            JsonNode result = client.sendRequest(method, params).get(3, TimeUnit.SECONDS);
+            markRequestSucceeded();
+            return result;
+        } catch (TimeoutException e) {
+            markRequestTimedOut(method);
+            return null;
+        } catch (Exception e) {
+            log.debug("Falha LSP {}: {}", method, e.getMessage());
+            return null;
+        }
     }
 
     public List<Location> definitions(Path file, String text, int line, int character, boolean references) {
@@ -272,6 +305,7 @@ public final class WebkitLspProcess {
         params.put("context", Map.of("diagnostics", List.of()));
         try {
             JsonNode result = client.sendRequest("textDocument/codeAction", params).get(3, TimeUnit.SECONDS);
+            markRequestSucceeded();
             if (result == null || !result.isArray()) return List.of();
             List<CodeAction> out = new ArrayList<>();
             for (JsonNode action : result) {
@@ -281,7 +315,13 @@ public final class WebkitLspProcess {
                 out.add(kind.startsWith("refactor") ? CodeAction.refactor(title, edits) : CodeAction.quickFix(title, edits));
             }
             return out;
-        } catch (Exception e) { log.debug("Falha LSP textDocument/codeAction: {}", e.getMessage()); return List.of(); }
+        } catch (TimeoutException e) {
+            markRequestTimedOut("textDocument/codeAction");
+            return List.of();
+        } catch (Exception e) {
+            log.debug("Falha LSP textDocument/codeAction: {}", e.getMessage());
+            return List.of();
+        }
     }
 
     private static Map<String, Object> lspRange(Range range) { return Map.of("start", Map.of("line", range.start().line(), "character", range.start().col()), "end", Map.of("line", range.end().line(), "character", range.end().col())); }
@@ -322,6 +362,54 @@ public final class WebkitLspProcess {
         return completionTriggerCharacters;
     }
 
+    public void probeResponsiveness() {
+        WebkitLspJsonRpcClient rpc = client;
+        if (rpc == null || !isRunning()) {
+            return;
+        }
+        if (hasStalledDiagnostics()) {
+            markHealthCheckTimedOut("diagnostics");
+            return;
+        }
+        String uri = lastSyncedText.keySet().stream().findFirst().orElse(null);
+        if (uri == null) {
+            return;
+        }
+        try {
+            rpc.sendRequest("textDocument/hover", Map.of(
+                    "textDocument", Map.of("uri", uri),
+                    "position", Map.of("line", 0, "character", 0)
+            )).get(HEALTH_CHECK_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            consecutiveHealthCheckTimeouts.set(0);
+        } catch (TimeoutException e) {
+            markHealthCheckTimedOut("health-check");
+        } catch (Exception e) {
+            if (hasCause(e, IOException.class)) {
+                markHealthCheckTimedOut("health-check/transport");
+            } else {
+                // A resposta JSON-RPC de erro também comprova que o servidor continua responsivo.
+                consecutiveHealthCheckTimeouts.set(0);
+                log.debug("Health check LSP {} respondeu com erro: {}", kind, e.getMessage());
+            }
+        }
+    }
+
+    private boolean hasStalledDiagnostics() {
+        long now = System.nanoTime();
+        long timeoutNanos = TimeUnit.SECONDS.toNanos(DIAGNOSTICS_STALL_TIMEOUT_SECONDS);
+        return diagnosticsPendingSince.values().stream()
+                .anyMatch(startedAt -> now - startedAt >= timeoutNanos);
+    }
+
+    private static boolean hasCause(Throwable error, Class<? extends Throwable> type) {
+        for (Throwable current = error; current != null; current = current.getCause()) {
+            if (type.isInstance(current)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     
 
 
@@ -342,6 +430,7 @@ public final class WebkitLspProcess {
         if (safeText.equals(lastSyncedText.put(uri, safeText))) {
             return;
         }
+        diagnosticsPendingSince.put(uri, System.nanoTime());
         Integer version = documentVersions.get(uri);
         if (version == null) {
             documentVersions.put(uri, 1);
@@ -389,7 +478,11 @@ public final class WebkitLspProcess {
                     "position", Map.of("line", line, "character", character),
                     "context", context
             )).get(COMPLETION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            markRequestSucceeded();
             return parseCompletions(rpc, result, prefix);
+        } catch (TimeoutException e) {
+            markRequestTimedOut("textDocument/completion");
+            return Collections.emptyList();
         } catch (Exception e) {
             log.debug("Falha ao obter completions do servidor {}: {}", kind, e.getMessage());
             return Collections.emptyList();
@@ -686,6 +779,7 @@ public final class WebkitLspProcess {
         documentVersions.remove(uri);
         lastSyncedText.remove(uri);
         diagnosticsByUri.remove(uri);
+        diagnosticsPendingSince.remove(uri);
         WebkitLspJsonRpcClient rpc = client;
         if (rpc != null && isRunning()) {
             rpc.sendNotification("textDocument/didClose", Map.of("textDocument", Map.of("uri", uri)));
@@ -724,6 +818,7 @@ public final class WebkitLspProcess {
             items.forEach(list::add);
         }
         diagnosticsByUri.put(uri, list);
+        diagnosticsPendingSince.remove(uri);
         Consumer<String> listener = onDiagnosticsPublished;
         if (listener != null) {
             listener.accept(uri);
@@ -778,6 +873,75 @@ public final class WebkitLspProcess {
         return filePath.toAbsolutePath().normalize().toUri().toString();
     }
 
+    private void markRequestSucceeded() {
+        consecutiveRequestTimeouts.set(0);
+    }
+
+    private void markRequestTimedOut(String method) {
+        int timeoutCount = consecutiveRequestTimeouts.incrementAndGet();
+        log.debug("Timeout LSP {} em {} ({}/{})",
+                kind, method, timeoutCount, UNRESPONSIVE_TIMEOUT_THRESHOLD);
+        if (timeoutCount < UNRESPONSIVE_TIMEOUT_THRESHOLD) {
+            return;
+        }
+        markUnresponsive(timeoutCount, method);
+    }
+
+    private void markHealthCheckTimedOut(String method) {
+        int timeoutCount = consecutiveHealthCheckTimeouts.incrementAndGet();
+        log.debug("Timeout do health check LSP {} ({}/{})",
+                kind, timeoutCount, UNRESPONSIVE_TIMEOUT_THRESHOLD);
+        if (timeoutCount < UNRESPONSIVE_TIMEOUT_THRESHOLD) {
+            return;
+        }
+        markUnresponsive(timeoutCount, method);
+    }
+
+    private void markUnresponsive(int timeoutCount, String source) {
+        synchronized (lock) {
+            if (state != State.RUNNING) {
+                return;
+            }
+            lastError = "Servidor sem resposta após " + timeoutCount
+                    + " timeouts consecutivos em " + source;
+            state = State.ERROR;
+        }
+        log.warn("Servidor de linguagem {} não está respondendo; recuperação solicitada.", kind);
+        signalRecoveryRequired();
+    }
+
+    private void onUnexpectedExit(Process exitedProcess) {
+        synchronized (lock) {
+            if (process != exitedProcess || state == State.STOPPED) {
+                return;
+            }
+            int exitCode;
+            try {
+                exitCode = exitedProcess.exitValue();
+            } catch (IllegalThreadStateException e) {
+                return;
+            }
+            lastError = "Processo terminou inesperadamente com código " + exitCode;
+            state = State.ERROR;
+            WebkitLspJsonRpcClient rpc = client;
+            client = null;
+            process = null;
+            if (rpc != null) {
+                rpc.close();
+            }
+            clearRuntimeState();
+        }
+        log.warn("Servidor de linguagem {} terminou inesperadamente; recuperação solicitada.", kind);
+        signalRecoveryRequired();
+    }
+
+    private void signalRecoveryRequired() {
+        Consumer<LspServerKind> listener = onRecoveryRequired;
+        if (listener != null && recoverySignalled.compareAndSet(false, true)) {
+            listener.accept(kind);
+        }
+    }
+
     public void stop() {
         synchronized (lock) {
             stopInternal();
@@ -796,6 +960,7 @@ public final class WebkitLspProcess {
             client = null;
         }
         Process p = process;
+        process = null;
         if (p != null && p.isAlive()) {
             p.destroy();
             try {
@@ -807,10 +972,20 @@ public final class WebkitLspProcess {
                 p.destroyForcibly();
             }
         }
+        clearRuntimeState();
+        state = State.STOPPED;
+    }
+
+    private void clearRuntimeState() {
         diagnosticsByUri.clear();
         documentVersions.clear();
         lastSyncedText.clear();
-        state = State.STOPPED;
+        diagnosticsPendingSince.clear();
+        serverCapabilities.clear();
+        completionResolveProvider = false;
+        completionTriggerCharacters = Set.of();
+        consecutiveRequestTimeouts.set(0);
+        consecutiveHealthCheckTimeouts.set(0);
     }
 
     private void drainStderrQuietly(Process started) {

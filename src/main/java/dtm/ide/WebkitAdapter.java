@@ -26,6 +26,7 @@ import dtm.ide.api.project.editor.IdeWordClickContext;
 import dtm.ide.api.theme.EditorTheme;
 import dtm.ide.editor.HtmlMarkupCompletionProvider;
 import dtm.ide.editor.theme.WebkitEditorTheme;
+import dtm.ide.lsp.LspServerKind;
 import dtm.ide.lsp.WebkitLspService;
 import dtm.ide.lsp.JsTsSnippets;
 import dtm.ide.navigation.JavaScriptNavigationIndex;
@@ -64,6 +65,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
 @Slf4j
@@ -76,6 +78,7 @@ public class WebkitAdapter extends IdeAdapter {
     private static final int HTML_CONTEXT_SCAN_WINDOW = 50_000;
 
     private final WebkitEditorRegistry editorRegistry = new WebkitEditorRegistry();
+    private final Set<LspServerKind> scheduledLspRecoveries = ConcurrentHashMap.newKeySet();
     private final EditorTheme editorTheme = new WebkitEditorTheme();
     private final HtmlMarkupCompletionProvider htmlCompletionProvider = new HtmlMarkupCompletionProvider();
     private final ExecutorService lspSetupExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -106,6 +109,7 @@ public class WebkitAdapter extends IdeAdapter {
     @Override
     public void onProjectClosed(IdeProjectContext context) {
         this.projectPath = null;
+        scheduledLspRecoveries.clear();
         editorRegistry.clearProjectEditors();
         WebkitLspService service = lspService;
         if (service != null) {
@@ -1016,6 +1020,47 @@ public class WebkitAdapter extends IdeAdapter {
         });
     }
 
+    private void scheduleLanguageServerRecovery(LspServerKind kind) {
+        Path expectedProject = projectPath;
+        if (kind == null || expectedProject == null || !scheduledLspRecoveries.add(kind)) {
+            return;
+        }
+        lspSetupExecutor.execute(() -> {
+            try {
+                if (!expectedProject.equals(projectPath)) {
+                    return;
+                }
+                WebkitLspService service = lspService;
+                if (service == null) {
+                    return;
+                }
+                List<Path> openFiles = editorRegistry.regularOpenHighlightablePaths().stream()
+                        .filter(path -> WebkitLspService.kindFor(path).orElse(null) == kind)
+                        .toList();
+                if (openFiles.isEmpty()) {
+                    service.stop(kind);
+                    return;
+                }
+
+                log.info("Reiniciando servidor de linguagem {} após falha.", kind);
+                service.restart(kind, expectedProject, progressListener());
+                if (!service.isRunning(kind)) {
+                    return;
+                }
+                for (Path file : openFiles) {
+                    IdeEditorContext editorContext = editorRegistry.editorContext(file);
+                    if (editorContext == null) {
+                        continue;
+                    }
+                    service.sync(file, editorContext.getText());
+                    refreshEditorAfterLanguageServerStart(service, file);
+                }
+            } finally {
+                scheduledLspRecoveries.remove(kind);
+            }
+        });
+    }
+
     private synchronized WebkitLspService ensureLspService() {
         if (lspService != null) {
             return lspService;
@@ -1023,6 +1068,7 @@ public class WebkitAdapter extends IdeAdapter {
         try {
             WebkitLspService service = new WebkitLspService(getResource(), resolveDownloadObserver());
             service.setDiagnosticsListener(file -> SwingUtilities.invokeLater(() -> requestRefreshDiagnostics(file)));
+            service.setRecoveryListener(this::scheduleLanguageServerRecovery);
             lspService = service;
         } catch (Exception e) {
             log.warn("Não foi possível preparar o serviço de LSP web: {}", e.getMessage());

@@ -24,6 +24,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 
@@ -34,14 +37,27 @@ import java.util.function.Consumer;
 @Slf4j
 public class WebkitLspService {
 
+    private static final long HEALTH_CHECK_INTERVAL_SECONDS = 15;
+
     private final NodeSdkInstaller nodeSdkInstaller;
     private final LspPackageInstaller lspPackageInstaller;
     private final Map<LspServerKind, WebkitLspProcess> processes = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService healthCheckExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread thread = new Thread(r, "orion-webkit-lsp-health-check");
+        thread.setDaemon(true);
+        return thread;
+    });
     private volatile Consumer<Path> diagnosticsListener;
+    private volatile Consumer<LspServerKind> recoveryListener;
 
     public WebkitLspService(Resource resource, DownloadObserver downloadObserver) {
         this.nodeSdkInstaller = new NodeSdkInstaller(resource, downloadObserver);
         this.lspPackageInstaller = new LspPackageInstaller(resource);
+        healthCheckExecutor.scheduleWithFixedDelay(
+                this::checkRunningProcesses,
+                HEALTH_CHECK_INTERVAL_SECONDS,
+                HEALTH_CHECK_INTERVAL_SECONDS,
+                TimeUnit.SECONDS);
     }
 
     public static Optional<LspServerKind> kindFor(Path filePath) {
@@ -66,6 +82,10 @@ public class WebkitLspService {
 
     public void setDiagnosticsListener(Consumer<Path> listener) {
         this.diagnosticsListener = listener;
+    }
+
+    public void setRecoveryListener(Consumer<LspServerKind> listener) {
+        this.recoveryListener = listener;
     }
 
     public boolean isRunning(LspServerKind kind) {
@@ -196,12 +216,37 @@ public class WebkitLspService {
         }
     }
 
+    public void restart(LspServerKind kind, Path projectRoot, DownloadProgressListener progressListener) {
+        stop(kind);
+        start(kind, projectRoot, progressListener);
+    }
+
     public void stopAll() {
         processes.values().forEach(WebkitLspProcess::stop);
     }
 
+    private void checkRunningProcesses() {
+        processes.values().stream()
+                .filter(WebkitLspProcess::isRunning)
+                .forEach(process -> {
+                    try {
+                        process.probeResponsiveness();
+                    } catch (Exception e) {
+                        log.debug("Falha no health check do servidor {}: {}",
+                                process.kind(), e.getMessage());
+                    }
+                });
+    }
+
     private WebkitLspProcess newProcess(LspServerKind kind) {
-        return new WebkitLspProcess(kind, this::onDiagnosticsPublished);
+        return new WebkitLspProcess(kind, this::onDiagnosticsPublished, this::onRecoveryRequired);
+    }
+
+    private void onRecoveryRequired(LspServerKind kind) {
+        Consumer<LspServerKind> listener = recoveryListener;
+        if (listener != null) {
+            listener.accept(kind);
+        }
     }
 
     private void onDiagnosticsPublished(String uri) {
