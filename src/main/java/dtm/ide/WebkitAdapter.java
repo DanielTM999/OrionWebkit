@@ -101,12 +101,12 @@ public class WebkitAdapter extends IdeAdapter {
     @Override
     public void onAdapterSelected(IdeProjectContext context) {
         this.projectPath = context == null ? null : context.getProjectPath().orElse(null);
-        
     }
 
     @Override
     public void onProjectClosed(IdeProjectContext context) {
         this.projectPath = null;
+        editorRegistry.clearProjectEditors();
         WebkitLspService service = lspService;
         if (service != null) {
             lspSetupExecutor.execute(service::stopAll);
@@ -996,6 +996,23 @@ public class WebkitAdapter extends IdeAdapter {
         lspSetupExecutor.execute(() -> {
             service.startForFile(filePath, project, progressListener());
             service.sync(filePath, text);
+            refreshEditorAfterLanguageServerStart(service, filePath);
+        });
+    }
+
+    private void refreshEditorAfterLanguageServerStart(WebkitLspService service, Path filePath) {
+        if (!service.isRunningFor(filePath)) {
+            return;
+        }
+        SwingUtilities.invokeLater(() -> {
+            IdeEditorContext editorContext = editorRegistry.editorContext(filePath);
+            if (editorContext == null) {
+                return;
+            }
+            requestRefreshDiagnostics(filePath);
+            requestRefreshCodeLenses(filePath);
+            requestRefreshInlayHints(filePath);
+            applyInitialSyntaxHighlight(editorContext);
         });
     }
 
