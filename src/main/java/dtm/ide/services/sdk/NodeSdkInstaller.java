@@ -132,13 +132,13 @@ public class NodeSdkInstaller {
         }
         Path archive = staging.resolve(artifact.fileName());
 
-        listener.onStart(NODE_PROGRESS_ID, artifact.displayName());
+        listener.onStart(NODE_PROGRESS_ID, artifact.displayName() + "...");
         try {
             Exception lastError = null;
             for (int attempt = 1; attempt <= DOWNLOAD_MAX_ATTEMPTS; attempt++) {
                 try {
                     downloadToFile(artifact, archive, listener);
-                    listener.onProgress(NODE_PROGRESS_ID, "Extraindo Node.js", -1);
+                    listener.onProgress(NODE_PROGRESS_ID, "Extraindo Node.js...", -1);
                     extractAndFlatten(archive, staging, sdkFolder);
                     return;
                 } catch (InterruptedException e) {
@@ -193,7 +193,7 @@ public class NodeSdkInstaller {
                                     int percent = (int) Math.clamp((bytesRead * 100L) / expectedSize, 0, 99);
                                     if (percent != lastPercent[0]) {
                                         lastPercent[0] = percent;
-                                        listener.onProgress(NODE_PROGRESS_ID, artifact.displayName(), percent);
+                                        listener.onProgress(NODE_PROGRESS_ID, artifact.displayName() + "...", percent);
                                     }
                                 }
                             } catch (Exception e) {

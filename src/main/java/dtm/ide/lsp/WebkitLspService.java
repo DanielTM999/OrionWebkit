@@ -21,6 +21,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -42,6 +43,7 @@ public class WebkitLspService {
     private final NodeSdkInstaller nodeSdkInstaller;
     private final LspPackageInstaller lspPackageInstaller;
     private final Map<LspServerKind, WebkitLspProcess> processes = new ConcurrentHashMap<>();
+    private final Map<LspServerKind, Path> projectRoots = new ConcurrentHashMap<>();
     private final ScheduledExecutorService healthCheckExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread thread = new Thread(r, "orion-webkit-lsp-health-check");
         thread.setDaemon(true);
@@ -99,22 +101,60 @@ public class WebkitLspService {
 
     public void start(LspServerKind kind, Path projectRoot, DownloadProgressListener progressListener) {
         WebkitLspProcess process = processes.computeIfAbsent(kind, this::newProcess);
-        if (process.isRunning()) {
+        Path normalizedRoot = normalizeRoot(projectRoot);
+        if (process.isRunning() && hasSameRoot(kind, normalizedRoot)) {
             return;
+        }
+        if (process.isRunning()) {
+            process.stop();
+            projectRoots.remove(kind);
         }
         DownloadProgressListener listener = progressListener == null ? DownloadProgressListener.NOOP : progressListener;
         String progressId = "webkitLsp." + kind.name().toLowerCase(Locale.ROOT);
-        listener.onStart(progressId, "Preparando servidor de linguagem (" + kind + ")");
+        listener.onStart(progressId, "Preparando servidor " + displayName(kind) + "...");
         try {
             Path node = nodeSdkInstaller.ensureNode(toNodeListener(listener));
+            if (lspPackageInstaller.resolveServerScript(kind).isEmpty()) {
+                listener.onProgress(progressId,
+                        "Instalando dependências do servidor " + displayName(kind) + "...", -1);
+            }
             Path script = lspPackageInstaller.ensureServerScript(kind, node);
+            listener.onProgress(progressId, "Analisando projeto (" + displayName(kind) + ")...", -1);
             List<String> command = List.of(node.toAbsolutePath().toString(), script.toAbsolutePath().toString(), "--stdio");
             process.start(command, script.getParent(), projectRoot, initializationOptionsFor(kind));
+            if (process.isRunning()) {
+                if (normalizedRoot == null) {
+                    projectRoots.remove(kind);
+                } else {
+                    projectRoots.put(kind, normalizedRoot);
+                }
+            } else {
+                projectRoots.remove(kind);
+            }
         } catch (Exception e) {
+            projectRoots.remove(kind);
             log.warn("Falha ao preparar o servidor de linguagem {}: {}", kind, e.getMessage());
         } finally {
             listener.onFinish(progressId);
         }
+    }
+
+    private static String displayName(LspServerKind kind) {
+        return switch (kind) {
+            case HTML -> "HTML";
+            case CSS -> "CSS";
+            case TYPESCRIPT -> "TypeScript/JavaScript";
+        };
+    }
+
+    private static Path normalizeRoot(Path projectRoot) {
+        return projectRoot == null ? null : projectRoot.toAbsolutePath().normalize();
+    }
+
+    private boolean hasSameRoot(LspServerKind kind, Path normalizedRoot) {
+        return normalizedRoot == null
+                ? !projectRoots.containsKey(kind)
+                : Objects.equals(projectRoots.get(kind), normalizedRoot);
     }
 
     
@@ -214,6 +254,7 @@ public class WebkitLspService {
         if (process != null) {
             process.stop();
         }
+        projectRoots.remove(kind);
     }
 
     public void restart(LspServerKind kind, Path projectRoot, DownloadProgressListener progressListener) {
@@ -223,6 +264,7 @@ public class WebkitLspService {
 
     public void stopAll() {
         processes.values().forEach(WebkitLspProcess::stop);
+        projectRoots.clear();
     }
 
     private void checkRunningProcesses() {

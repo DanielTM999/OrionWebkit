@@ -27,6 +27,7 @@ import dtm.ide.api.theme.EditorTheme;
 import dtm.ide.editor.HtmlMarkupCompletionProvider;
 import dtm.ide.editor.theme.WebkitEditorTheme;
 import dtm.ide.lsp.LspServerKind;
+import dtm.ide.lsp.LspStartupCoordinator;
 import dtm.ide.lsp.WebkitLspService;
 import dtm.ide.lsp.JsTsSnippets;
 import dtm.ide.navigation.JavaScriptNavigationIndex;
@@ -66,6 +67,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
 @Slf4j
@@ -81,11 +83,11 @@ public class WebkitAdapter extends IdeAdapter {
     private final Set<LspServerKind> scheduledLspRecoveries = ConcurrentHashMap.newKeySet();
     private final EditorTheme editorTheme = new WebkitEditorTheme();
     private final HtmlMarkupCompletionProvider htmlCompletionProvider = new HtmlMarkupCompletionProvider();
-    private final ExecutorService lspSetupExecutor = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "orion-webkit-lsp-setup");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService lspSetupExecutor = Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual().name("orion-webkit-lsp-setup-", 0).factory());
+    private final LspStartupCoordinator lspStartupCoordinator = new LspStartupCoordinator();
+    private final Map<LspServerKind, Object> lspSetupLocks = new ConcurrentHashMap<>();
+    private final AtomicLong projectGeneration = new AtomicLong();
 
 
     private volatile WebkitLspService lspService;
@@ -103,17 +105,33 @@ public class WebkitAdapter extends IdeAdapter {
 
     @Override
     public void onAdapterSelected(IdeProjectContext context) {
-        this.projectPath = context == null ? null : context.getProjectPath().orElse(null);
+        Path selectedProject = context == null ? null : context.getProjectPath().orElse(null);
+        if (!java.util.Objects.equals(this.projectPath, selectedProject)) {
+            projectGeneration.incrementAndGet();
+            lspStartupCoordinator.invalidate();
+        }
+        this.projectPath = selectedProject;
     }
 
     @Override
     public void onProjectClosed(IdeProjectContext context) {
+        long closedGeneration = projectGeneration.incrementAndGet();
         this.projectPath = null;
+        lspStartupCoordinator.invalidate();
         scheduledLspRecoveries.clear();
         editorRegistry.clearProjectEditors();
         WebkitLspService service = lspService;
         if (service != null) {
-            lspSetupExecutor.execute(service::stopAll);
+            lspSetupExecutor.execute(() -> {
+                for (LspServerKind kind : LspServerKind.values()) {
+                    synchronized (lspSetupLocks.computeIfAbsent(kind, ignored -> new Object())) {
+                        if (projectGeneration.get() != closedGeneration) {
+                            return;
+                        }
+                        service.stop(kind);
+                    }
+                }
+            });
         }
     }
 
@@ -209,7 +227,7 @@ public class WebkitAdapter extends IdeAdapter {
         }
         Path normalized = WebkitPathConventions.normalizePath(context.filePath());
         editorRegistry.trackEditor(normalized, context);
-        applyInitialSyntaxHighlight(context);
+        context.setSyntaxHighlightEnabled(true);
     }
 
     @Override
@@ -220,8 +238,19 @@ public class WebkitAdapter extends IdeAdapter {
         }
         Path normalized = WebkitPathConventions.normalizePath(editorContext.filePath());
         editorRegistry.trackEditor(normalized, editorContext);
-        applyInitialSyntaxHighlight(editorContext);
+        scheduleInitialSyntaxHighlight(normalized);
         startLanguageServerFor(normalized, editorContext.getText());
+    }
+
+    @Override
+    public void onEditorSelected(IdeEditorContext editorContext) {
+        if (editorContext == null || editorContext.filePath() == null
+                || !WebkitPathConventions.isHighlightable(editorContext.filePath())) {
+            return;
+        }
+        Path normalized = WebkitPathConventions.normalizePath(editorContext.filePath());
+        editorRegistry.trackEditor(normalized, editorContext);
+        scheduleInitialSyntaxHighlight(normalized);
     }
 
     @Override
@@ -982,13 +1011,19 @@ public class WebkitAdapter extends IdeAdapter {
         return characters;
     }
 
-    private void applyInitialSyntaxHighlight(IdeEditorContext context) {
-        try {
-            context.setSyntaxHighlightEnabled(true);
-            context.applySyntaxHighlight();
-        } catch (Exception e) {
-            log.debug("Falha ao aplicar realce inicial: {}", e.getMessage());
-        }
+    private void scheduleInitialSyntaxHighlight(Path filePath) {
+        SwingUtilities.invokeLater(() -> {
+            IdeEditorContext context = editorRegistry.editorContext(filePath);
+            if (context == null) {
+                return;
+            }
+            try {
+                context.setSyntaxHighlightEnabled(true);
+                context.applySyntaxHighlight();
+            } catch (Exception e) {
+                log.debug("Falha ao aplicar realce inicial: {}", e.getMessage());
+            }
+        });
     }
 
     private void startLanguageServerFor(Path filePath, String text) {
@@ -996,11 +1031,37 @@ public class WebkitAdapter extends IdeAdapter {
         if (service == null) {
             return;
         }
+        LspServerKind kind = WebkitLspService.kindFor(filePath).orElse(null);
+        if (kind == null) {
+            return;
+        }
         Path project = projectPath;
+        long generation = projectGeneration.get();
+        if (!lspStartupCoordinator.requestStart(kind, generation, filePath, text)) {
+            return;
+        }
         lspSetupExecutor.execute(() -> {
-            service.startForFile(filePath, project, progressListener());
-            service.sync(filePath, text);
-            refreshEditorAfterLanguageServerStart(service, filePath);
+            synchronized (lspSetupLocks.computeIfAbsent(kind, ignored -> new Object())) {
+                try {
+                    service.start(kind, project, progressListener());
+                    if (generation != projectGeneration.get()
+                            || !java.util.Objects.equals(project, projectPath)) {
+                        service.stop(kind);
+                        return;
+                    }
+                    List<LspStartupCoordinator.PendingDocument> pendingDocuments =
+                            lspStartupCoordinator.pendingDocuments(kind, generation);
+                    if (pendingDocuments.isEmpty()) {
+                        return;
+                    }
+                    for (LspStartupCoordinator.PendingDocument pending : pendingDocuments) {
+                        service.sync(pending.file(), pending.text());
+                        refreshEditorAfterLanguageServerStart(service, pending.file());
+                    }
+                } finally {
+                    lspStartupCoordinator.finish(kind, generation);
+                }
+            }
         });
     }
 
@@ -1016,7 +1077,7 @@ public class WebkitAdapter extends IdeAdapter {
             requestRefreshDiagnostics(filePath);
             requestRefreshCodeLenses(filePath);
             requestRefreshInlayHints(filePath);
-            applyInitialSyntaxHighlight(editorContext);
+            scheduleInitialSyntaxHighlight(filePath);
         });
     }
 
@@ -1026,37 +1087,39 @@ public class WebkitAdapter extends IdeAdapter {
             return;
         }
         lspSetupExecutor.execute(() -> {
-            try {
-                if (!expectedProject.equals(projectPath)) {
-                    return;
-                }
-                WebkitLspService service = lspService;
-                if (service == null) {
-                    return;
-                }
-                List<Path> openFiles = editorRegistry.regularOpenHighlightablePaths().stream()
-                        .filter(path -> WebkitLspService.kindFor(path).orElse(null) == kind)
-                        .toList();
-                if (openFiles.isEmpty()) {
-                    service.stop(kind);
-                    return;
-                }
-
-                log.info("Reiniciando servidor de linguagem {} após falha.", kind);
-                service.restart(kind, expectedProject, progressListener());
-                if (!service.isRunning(kind)) {
-                    return;
-                }
-                for (Path file : openFiles) {
-                    IdeEditorContext editorContext = editorRegistry.editorContext(file);
-                    if (editorContext == null) {
-                        continue;
+            synchronized (lspSetupLocks.computeIfAbsent(kind, ignored -> new Object())) {
+                try {
+                    if (!expectedProject.equals(projectPath)) {
+                        return;
                     }
-                    service.sync(file, editorContext.getText());
-                    refreshEditorAfterLanguageServerStart(service, file);
+                    WebkitLspService service = lspService;
+                    if (service == null) {
+                        return;
+                    }
+                    List<Path> openFiles = editorRegistry.regularOpenHighlightablePaths().stream()
+                            .filter(path -> WebkitLspService.kindFor(path).orElse(null) == kind)
+                            .toList();
+                    if (openFiles.isEmpty()) {
+                        service.stop(kind);
+                        return;
+                    }
+
+                    log.info("Reiniciando servidor de linguagem {} após falha.", kind);
+                    service.restart(kind, expectedProject, progressListener());
+                    if (!service.isRunning(kind)) {
+                        return;
+                    }
+                    for (Path file : openFiles) {
+                        IdeEditorContext editorContext = editorRegistry.editorContext(file);
+                        if (editorContext == null) {
+                            continue;
+                        }
+                        service.sync(file, editorContext.getText());
+                        refreshEditorAfterLanguageServerStart(service, file);
+                    }
+                } finally {
+                    scheduledLspRecoveries.remove(kind);
                 }
-            } finally {
-                scheduledLspRecoveries.remove(kind);
             }
         });
     }

@@ -44,7 +44,9 @@ public final class WebkitLspProcess {
 
     private static final long INITIALIZE_TIMEOUT_MS = 20_000;
     private static final long SHUTDOWN_TIMEOUT_MS = 2_000;
-    private static final long COMPLETION_TIMEOUT_MS = 3_000;
+    private static final long AUTOMATIC_REQUEST_TIMEOUT_MS = 1_000;
+    private static final long EXPLICIT_REQUEST_TIMEOUT_MS = 3_000;
+    private static final long COMPLETION_TIMEOUT_MS = 1_000;
     private static final long HEALTH_CHECK_TIMEOUT_MS = 2_000;
     private static final long DIAGNOSTICS_STALL_TIMEOUT_SECONDS = 30;
     private static final int UNRESPONSIVE_TIMEOUT_THRESHOLD = 2;
@@ -239,18 +241,23 @@ public final class WebkitLspProcess {
         }
     }
 
-    private JsonNode request(String method, Path file, String text, int line, int character, Map<String, Object> extra) {
+    private JsonNode request(String method, Path file, String text, int line, int character,
+                             Map<String, Object> extra, long timeoutMs) {
         if (client == null || !isRunning() || file == null) return null;
         syncDocument(file, text);
         Map<String, Object> params = new HashMap<>(extra);
         params.put("textDocument", Map.of("uri", toUri(file)));
         params.put("position", Map.of("line", line, "character", character));
         try {
-            JsonNode result = client.sendRequest(method, params).get(3, TimeUnit.SECONDS);
+            JsonNode result = client.sendRequest(method, params).get(timeoutMs, TimeUnit.MILLISECONDS);
             markRequestSucceeded();
             return result;
         } catch (TimeoutException e) {
-            markRequestTimedOut(method);
+            if (timeoutMs <= AUTOMATIC_REQUEST_TIMEOUT_MS) {
+                logAutomaticRequestTimeout(method);
+            } else {
+                markRequestTimedOut(method);
+            }
             return null;
         } catch (Exception e) {
             log.debug("Falha LSP {}: {}", method, e.getMessage());
@@ -262,20 +269,23 @@ public final class WebkitLspProcess {
         String capability = references ? "referencesProvider" : "definitionProvider";
         if (!serverCapabilities.contains(capability)) return List.of();
         JsonNode result = request(references ? "textDocument/references" : "textDocument/definition", file, text, line, character,
-                references ? Map.of("context", Map.of("includeDeclaration", true)) : Map.of());
+                references ? Map.of("context", Map.of("includeDeclaration", true)) : Map.of(),
+                EXPLICIT_REQUEST_TIMEOUT_MS);
         return parseLocations(result);
     }
 
     public List<Range> highlights(Path file, String text, int line, int character) {
         if (!serverCapabilities.contains("documentHighlightProvider")) return List.of();
-        JsonNode result = request("textDocument/documentHighlight", file, text, line, character, Map.of());
+        JsonNode result = request("textDocument/documentHighlight", file, text, line, character, Map.of(),
+                AUTOMATIC_REQUEST_TIMEOUT_MS);
         if (result == null || !result.isArray()) return List.of();
         List<Range> out = new ArrayList<>(); for (JsonNode n : result) { Range r = parseRange(n.get("range")); if (r != null) out.add(r); } return out;
     }
 
     public HoverInfo hover(Path file, String text, int line, int character) {
         if (!serverCapabilities.contains("hoverProvider")) return null;
-        JsonNode result = request("textDocument/hover", file, text, line, character, Map.of());
+        JsonNode result = request("textDocument/hover", file, text, line, character, Map.of(),
+                AUTOMATIC_REQUEST_TIMEOUT_MS);
         if (result == null || result.isNull()) return null;
         String content = markup(result.get("contents")); if (content.isBlank()) return null;
         Range r = parseRange(result.get("range"));
@@ -284,7 +294,8 @@ public final class WebkitLspProcess {
 
     public SignatureHelp signatureHelp(Path file, String text, int line, int character) {
         if (!serverCapabilities.contains("signatureHelpProvider")) return null;
-        JsonNode result = request("textDocument/signatureHelp", file, text, line, character, Map.of());
+        JsonNode result = request("textDocument/signatureHelp", file, text, line, character, Map.of(),
+                AUTOMATIC_REQUEST_TIMEOUT_MS);
         if (result == null || !result.path("signatures").isArray()) return null;
         List<SignatureInformation> signatures = new ArrayList<>();
         for (JsonNode s : result.get("signatures")) { List<ParameterInformation> ps = new ArrayList<>(); for (JsonNode p : s.path("parameters")) ps.add(new ParameterInformation(p.path("label").isTextual() ? p.path("label").asString("") : p.path("label").toString(), markup(p.get("documentation")))); signatures.add(new SignatureInformation(s.path("label").asString(""), markup(s.get("documentation")), ps)); }
@@ -293,7 +304,8 @@ public final class WebkitLspProcess {
 
     public List<TextEdit> rename(Path file, String text, int line, int character, String newName) {
         if (!serverCapabilities.contains("renameProvider") || newName == null || newName.isBlank()) return List.of();
-        JsonNode result = request("textDocument/rename", file, text, line, character, Map.of("newName", newName));
+        JsonNode result = request("textDocument/rename", file, text, line, character,
+                Map.of("newName", newName), EXPLICIT_REQUEST_TIMEOUT_MS);
         return editsForCurrentDocument(result, toUri(file));
     }
 
@@ -304,7 +316,8 @@ public final class WebkitLspProcess {
         params.put("range", lspRange(range));
         params.put("context", Map.of("diagnostics", List.of()));
         try {
-            JsonNode result = client.sendRequest("textDocument/codeAction", params).get(3, TimeUnit.SECONDS);
+            JsonNode result = client.sendRequest("textDocument/codeAction", params)
+                    .get(EXPLICIT_REQUEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             markRequestSucceeded();
             if (result == null || !result.isArray()) return List.of();
             List<CodeAction> out = new ArrayList<>();
@@ -481,7 +494,7 @@ public final class WebkitLspProcess {
             markRequestSucceeded();
             return parseCompletions(rpc, result, prefix);
         } catch (TimeoutException e) {
-            markRequestTimedOut("textDocument/completion");
+            logAutomaticRequestTimeout("textDocument/completion");
             return Collections.emptyList();
         } catch (Exception e) {
             log.debug("Falha ao obter completions do servidor {}: {}", kind, e.getMessage());
@@ -875,6 +888,11 @@ public final class WebkitLspProcess {
 
     private void markRequestSucceeded() {
         consecutiveRequestTimeouts.set(0);
+    }
+
+    private void logAutomaticRequestTimeout(String method) {
+        log.debug("Timeout curto do LSP {} em {}; o editor continuarÃ¡ responsivo enquanto o servidor processa.",
+                kind, method);
     }
 
     private void markRequestTimedOut(String method) {

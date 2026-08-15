@@ -13,6 +13,7 @@
         <request.action.version>1.0.7</request.action.version>
         <object.mapper.version>3.2.0</object.mapper.version>
         <apache.compress.version>1.26.2</apache.compress.version>
+        <junit.version>5.11.4</junit.version>
 
         <maven.compiler.source>25</maven.compiler.source>
         <maven.compiler.target>25</maven.compiler.target>
@@ -47,6 +48,12 @@
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-compress</artifactId>
             <version>${apache.compress.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 

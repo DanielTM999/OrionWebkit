@@ -138,6 +138,26 @@
       <version>1.0.0</version>
       <scope>provided</scope>
     </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.11.4</version>
+      <scope>test</scope>
+      <exclusions>
+        <exclusion>
+          <artifactId>junit-jupiter-api</artifactId>
+          <groupId>org.junit.jupiter</groupId>
+        </exclusion>
+        <exclusion>
+          <artifactId>junit-jupiter-params</artifactId>
+          <groupId>org.junit.jupiter</groupId>
+        </exclusion>
+        <exclusion>
+          <artifactId>junit-jupiter-engine</artifactId>
+          <groupId>org.junit.jupiter</groupId>
+        </exclusion>
+      </exclusions>
+    </dependency>
   </dependencies>
   <properties>
     <apache.compress.version>1.26.2</apache.compress.version>
@@ -146,6 +166,7 @@
     <orion.api.version>1.0.0</orion.api.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <object.mapper.version>3.2.0</object.mapper.version>
+    <junit.version>5.11.4</junit.version>
     <request.action.version>1.0.7</request.action.version>
   </properties>
 </project>
