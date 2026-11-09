@@ -6,6 +6,7 @@ import dtm.stools.component.feedback.badge.BadgeLabel;
 import dtm.stools.component.feedback.progress.ProgressBar;
 import dtm.stools.component.feedback.steps.StepsPanel;
 import dtm.stools.component.form.FormField;
+import dtm.stools.component.inputfields.osfilepicker.OsFilePicker;
 import dtm.stools.component.inputfields.segmentedfield.SegmentedField;
 import dtm.stools.component.inputfields.textfield.MaskedTextField;
 import dtm.stools.component.panels.card.CardPanel;
@@ -15,6 +16,7 @@ import javax.swing.*;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import java.awt.*;
+import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -244,10 +246,10 @@ final class ReactProjectWizardView extends JPanel {
     }
 
     private void chooseLocation() {
-        JFileChooser chooser = new JFileChooser(location.getText());
-        chooser.setDialogTitle("Escolher pasta do projeto");
-        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
-        if (chooser.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) location.setText(chooser.getSelectedFile().toString());
+        File selectedLocale = OsFilePicker.openDirectory("Escolher pasta do projeto");
+        if(selectedLocale != null){
+            location.setText(selectedLocale.toString());
+        }
     }
 
     private Path targetPath() { return Path.of(location.getText().trim()).resolve(name.getText().trim()).toAbsolutePath().normalize(); }
