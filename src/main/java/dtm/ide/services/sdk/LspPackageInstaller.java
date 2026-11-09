@@ -7,7 +7,6 @@ import dtm.stools.component.popup.ModernDialog;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -38,7 +37,7 @@ public class LspPackageInstaller {
     }
 
     public Optional<Path> resolveServerScript(LspServerKind kind) {
-        Path lspDir = lspRoot();
+        Path lspDir = installationRoot(kind);
         if (lspDir == null) {
             return Optional.empty();
         }
@@ -52,7 +51,7 @@ public class LspPackageInstaller {
             if (existing.isPresent()) {
                 return existing.get();
             }
-            Path lspDir = lspRoot();
+            Path lspDir = installationRoot(kind);
             if (lspDir == null) {
                 throw displayException("Diretório de recursos do plugin indisponível.", null);
             }
@@ -74,7 +73,7 @@ public class LspPackageInstaller {
 
 
     public Optional<Path> resolveTypescriptLibDir() {
-        Path lspDir = lspRoot();
+        Path lspDir = installationRoot(LspServerKind.TYPESCRIPT);
         if (lspDir == null) {
             return Optional.empty();
         }
@@ -121,14 +120,17 @@ public class LspPackageInstaller {
         command.add("--no-save");
         command.add("--loglevel=error");
 
+        Process process = null;
+        Path output = null;
         try {
-            Process process = new ProcessBuilder(command)
+            output = Files.createTempFile(lspDir, "npm-install-", ".log");
+            ProcessBuilder builder = new ProcessBuilder(command)
                     .directory(lspDir.toFile())
                     .redirectErrorStream(true)
-                    .start();
-            Thread drain = new Thread(() -> drainQuietly(process.getInputStream()), "orion-webkit-npm-install");
-            drain.setDaemon(true);
-            drain.start();
+                    .redirectOutput(output.toFile());
+            builder.environment().put("PATH", nodeExecutable.toAbsolutePath().getParent()
+                    + System.getProperty("path.separator") + System.getenv().getOrDefault("PATH", ""));
+            process = builder.start();
 
             boolean finished = process.waitFor(INSTALL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             if (!finished) {
@@ -136,7 +138,10 @@ public class LspPackageInstaller {
                 throw displayException("A instalação via npm excedeu o tempo limite.", null);
             }
             if (process.exitValue() != 0) {
-                throw displayException("Falha ao instalar pacotes npm: " + String.join(", ", packages), null);
+                String details = installationDetails(output);
+                log.warn("npm terminou com código {} em {}: {}", process.exitValue(), lspDir, details);
+                throw displayException("Falha ao instalar pacotes npm: " + String.join(", ", packages)
+                        + "\n" + details, null);
             }
         } catch (DisplayException e) {
             throw e;
@@ -145,6 +150,14 @@ public class LspPackageInstaller {
             throw displayException("Instalação via npm interrompida.", e);
         } catch (IOException e) {
             throw displayException("Não foi possível executar o npm.", e);
+        } finally {
+            if (process != null && process.isAlive()) {
+                process.descendants().forEach(ProcessHandle::destroyForcibly);
+                process.destroyForcibly();
+            }
+            if (output != null) {
+                try { Files.deleteIfExists(output); } catch (IOException ignored) { }
+            }
         }
     }
 
@@ -192,6 +205,13 @@ public class LspPackageInstaller {
         return base == null ? null : base.resolve("sdk").resolve(LSP_DIR).toAbsolutePath().normalize();
     }
 
+    // npm --no-save prunes other packages in the same prefix. Keep each server
+    // family isolated so installing one cannot remove or rename a running server.
+    private Path installationRoot(LspServerKind kind) {
+        Path root = lspRoot();
+        return root == null ? null : root.resolve(kind == LspServerKind.TYPESCRIPT ? "typescript" : "web");
+    }
+
     private Path resourcePath() {
         try {
             return resource == null ? null : resource.getResourcePath();
@@ -200,14 +220,17 @@ public class LspPackageInstaller {
         }
     }
 
-    private static void drainQuietly(InputStream in) {
-        try (in) {
-            byte[] buffer = new byte[8192];
-            while (in.read(buffer) != -1) {
-                
+    private static String installationDetails(Path output) {
+        var lines = new java.util.ArrayDeque<String>();
+        try (var reader = Files.newBufferedReader(output)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (lines.size() == 20) lines.removeFirst();
+                lines.addLast(line.substring(0, Math.min(line.length(), 1000)));
             }
         } catch (IOException ignored) {
         }
+        return String.join("\n", lines);
     }
 
     private static DisplayException displayException(String message, Throwable cause) {
