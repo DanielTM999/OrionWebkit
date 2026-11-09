@@ -151,7 +151,8 @@ public class WebkitAdapter extends IdeAdapter {
     public RunProcessHandle launch(RunConfigurationData data, RunExecutionContext context) throws Exception {
         Path root = context == null ? projectPath : context.getProjectPath();
         if (root == null) throw new IllegalStateException("Abra um projeto para iniciar o servidor React.");
-        return reactRunSupport.launch(getResource(), data, root);
+        return reactRunSupport.launch(getResource(), data, root,
+                url -> SwingUtilities.invokeLater(() -> openWebBrowser(url)));
     }
 
     @Override

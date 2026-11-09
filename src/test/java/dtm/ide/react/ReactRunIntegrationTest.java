@@ -17,12 +17,22 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 class ReactRunIntegrationTest {
     @Test
     void launchesConfiguredProjectAndServesItsPage() throws Exception {
+        launchProject(true);
+    }
+
+    @Test
+    void leavesBrowserClosedWhenOptionIsDisabled() throws Exception {
+        launchProject(false);
+    }
+
+    private void launchProject(boolean launchBrowser) throws Exception {
         String project = System.getProperty("webkit.reactTestProject");
         assumeTrue(project != null);
         ReactRunSupport support = new ReactRunSupport();
         var data = RunConfigurationData.builder().type(ReactRunSupport.TYPE).id("integration")
-                .properties(Map.of("directory", ".", "script", "")).build();
-        var handle = support.launch(null, data, Path.of(project));
+                .properties(Map.of("directory", ".", "script", "", "launchBrowser", launchBrowser)).build();
+        CompletableFuture<String> browser = new CompletableFuture<>();
+        var handle = support.launch(null, data, Path.of(project), browser::complete);
         CompletableFuture<String> address = new CompletableFuture<>();
         StringBuilder output = new StringBuilder();
         Thread reader = Thread.ofVirtual().start(() -> {
@@ -37,8 +47,12 @@ class ReactRunIntegrationTest {
             } catch (Exception error) { address.completeExceptionally(error); }
         });
         try {
-            // The fixture binds to 0.0.0.0 (IPv4); localhost may resolve to ::1.
             URI url = URI.create(address.get(30, TimeUnit.SECONDS).replace("localhost", "127.0.0.1"));
+            if (launchBrowser) {
+                assertEquals(url, URI.create(browser.get(5, TimeUnit.SECONDS).replace("localhost", "127.0.0.1")));
+            } else {
+                assertFalse(browser.isDone());
+            }
             var response = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build()
                     .send(HttpRequest.newBuilder(url)
                     .timeout(Duration.ofSeconds(10)).GET().build(), HttpResponse.BodyHandlers.ofString());

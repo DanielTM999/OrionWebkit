@@ -6,6 +6,7 @@ import dtm.ide.utils.NodeSdkUtils;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 public final class ReactRunSupport {
     public static final String TYPE = "webkit.react.server";
@@ -26,6 +27,10 @@ public final class ReactRunSupport {
     }
 
     public RunProcessHandle launch(Resource resource, RunConfigurationData data, Path project) throws Exception {
+        return launch(resource, data, project, null);
+    }
+
+    public RunProcessHandle launch(Resource resource, RunConfigurationData data, Path project, Consumer<String> browser) throws Exception {
         if (!TYPE.equals(data.getType())) throw new IllegalArgumentException("Tipo de execução desconhecido.");
         var properties = data.getProperties() == null ? Map.<String, Object>of() : data.getProperties();
         String directory = String.valueOf(properties.getOrDefault("directory", ".")).trim();
@@ -33,10 +38,18 @@ public final class ReactRunSupport {
         String script = String.valueOf(properties.getOrDefault("script", "")).trim();
         if (script.isEmpty()) script = ReactProjectDetector.serverScript(root);
         if (!script.matches("[a-zA-Z0-9:_-]+")) throw new IllegalArgumentException("Nome de script inválido.");
-        Process process = npm(resource, root, "run", script).start();
+        ProcessBuilder builder = npm(resource, root, "run", script);
+        builder.environment().put("BROWSER", "none");
+        Process process = builder.start();
         processes.put(process, key(data));
         process.onExit().thenRun(() -> processes.remove(process));
-        return RunProcessHandle.builder().output(process.getInputStream()).readonly(true)
+        var output = process.getInputStream();
+        if (browser != null && Boolean.parseBoolean(String.valueOf(properties.getOrDefault("launchBrowser", false)))) {
+            output = new ReactServerOutput(output, url -> {
+                if (process.isAlive()) browser.accept(url);
+            });
+        }
+        return RunProcessHandle.builder().output(output).readonly(true)
                 .alive(process::isAlive).terminate(() -> terminate(process)).build();
     }
 
