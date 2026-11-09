@@ -46,6 +46,18 @@ Digite o gatilho e abra o autocomplete. Quando o gatilho for digitado por comple
 
 Os snippets usam placeholders navegáveis, como `${1:nome}` e `$0`.
 
+## Bootstrap
+
+O plugin reconhece Bootstrap em links HTML locais ou CDN, imports JavaScript/React e CSS/Sass, e dependências `bootstrap` ou `react-bootstrap` no `package.json`. A busca no projeto acontece em segundo plano a cada cinco segundos e ignora dependências instaladas e pastas de build.
+
+Quando detectado, o autocomplete oferece classes em `class` e `className`, incluindo valores literais JSX, classes responsivas, atributos `data-bs-*` e seus valores mais comuns. Em CSS, oferece seletores de classe e variáveis `--bs-*`. O catálogo local usa Bootstrap 5.3.8 e não precisa de rede durante a edição; não adapta as sugestões para Bootstrap 3 ou 4.
+
+Os catálogos em `src/main/resources/bootstrap` foram extraídos do [CSS oficial do Bootstrap 5.3.8](https://github.com/twbs/bootstrap/blob/v5.3.8/dist/css/bootstrap.css). A licença MIT está incluída nessa pasta.
+
+## Formatação
+
+A formatação de HTML, CSS, JavaScript e TypeScript, incluindo JSX/TSX, usa os servidores de linguagem e respeita o tamanho de indentação e a opção de tabs ou espaços da IDE. Ao formatar uma seleção, o documento completo fornece o contexto e apenas o trecho selecionado é retornado. Se o servidor ainda estiver iniciando, a barra de status informa quando é necessário tentar novamente.
+
 ## Servidores de linguagem
 
 Na primeira utilização, o plugin prepara automaticamente o runtime Node.js e instala os servidores necessários:

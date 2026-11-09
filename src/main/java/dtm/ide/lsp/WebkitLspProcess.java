@@ -47,6 +47,7 @@ public final class WebkitLspProcess {
     private static final long AUTOMATIC_REQUEST_TIMEOUT_MS = 1_000;
     private static final long EXPLICIT_REQUEST_TIMEOUT_MS = 3_000;
     private static final long COMPLETION_TIMEOUT_MS = 1_000;
+    private static final long FORMATTING_TIMEOUT_MS = 10_000;
     private static final long HEALTH_CHECK_TIMEOUT_MS = 2_000;
     private static final long DIAGNOSTICS_STALL_TIMEOUT_SECONDS = 30;
     private static final int UNRESPONSIVE_TIMEOUT_THRESHOLD = 2;
@@ -223,7 +224,7 @@ public final class WebkitLspProcess {
             return;
         }
         JsonNode capabilities = initializeResult.path("capabilities");
-        for (String name : List.of("hoverProvider", "definitionProvider", "referencesProvider", "documentHighlightProvider", "renameProvider", "codeActionProvider", "signatureHelpProvider")) {
+        for (String name : List.of("hoverProvider", "definitionProvider", "referencesProvider", "documentHighlightProvider", "renameProvider", "codeActionProvider", "signatureHelpProvider", "documentFormattingProvider", "documentRangeFormattingProvider")) {
             if (capabilities.path(name).asBoolean(false) || capabilities.path(name).isObject()) serverCapabilities.add(name);
         }
         JsonNode completionProvider = capabilities.path("completionProvider");
@@ -272,6 +273,31 @@ public final class WebkitLspProcess {
                 references ? Map.of("context", Map.of("includeDeclaration", true)) : Map.of(),
                 EXPLICIT_REQUEST_TIMEOUT_MS);
         return parseLocations(result);
+    }
+
+    public List<TextEdit> format(Path file, String text, Range range, Map<String, Object> options) {
+        String capability = range == null ? "documentFormattingProvider" : "documentRangeFormattingProvider";
+        if (!serverCapabilities.contains(capability) || !isRunning()) return List.of();
+        syncDocument(file, text);
+        Map<String, Object> params = new HashMap<>();
+        params.put("textDocument", Map.of("uri", toUri(file)));
+        params.put("options", options);
+        if (range != null) params.put("range", lspRange(range));
+        String method = range == null ? "textDocument/formatting" : "textDocument/rangeFormatting";
+        try {
+            JsonNode response = client.sendRequest(method, params).get(FORMATTING_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            markRequestSucceeded();
+            return response == null || !response.isArray() ? List.of() : parseAdditionalTextEdits(response);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            return List.of();
+        } catch (TimeoutException error) {
+            markRequestTimedOut(method);
+            return List.of();
+        } catch (Exception error) {
+            log.debug("Falha LSP {}: {}", method, error.getMessage());
+            return List.of();
+        }
     }
 
     public List<Range> highlights(Path file, String text, int line, int character) {

@@ -22,7 +22,6 @@ import java.awt.Graphics2D;
 import java.awt.Insets;
 import java.awt.RenderingHints;
 
-/** Styled dialog content for the Project Tree's New > Web file action. */
 public final class NewWebItemPanel extends JPanel {
 
     public enum Kind {
@@ -68,10 +67,15 @@ public final class NewWebItemPanel extends JPanel {
     public record Result(String name, Kind kind) { }
 
     private final JTextField nameField = new JTextField();
-    private final JList<Kind> kindList = new JList<>(Kind.values());
+    private final JList<Kind> kindList;
 
     public NewWebItemPanel() {
+        this(false);
+    }
+
+    public NewWebItemPanel(boolean reactOnly) {
         super(new BorderLayout(0, 10));
+        kindList = new JList<>(reactOnly ? new Kind[]{Kind.JSX, Kind.TSX} : Kind.values());
         setOpaque(false);
         build();
         wire();
@@ -99,7 +103,7 @@ public final class NewWebItemPanel extends JPanel {
         kindList.setForeground(foreground());
         kindList.setBorder(BorderFactory.createEmptyBorder(2, 0, 0, 0));
         kindList.setCellRenderer(new KindRenderer());
-        kindList.setSelectedValue(Kind.HTML, true);
+        kindList.setSelectedIndex(0);
 
         add(nameField, BorderLayout.NORTH);
         add(kindList, BorderLayout.CENTER);

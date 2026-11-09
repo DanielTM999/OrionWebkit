@@ -9,7 +9,7 @@ import dtm.ide.api.annotations.PluginReference;
 import dtm.ide.api.context.IdeProjectContext;
 import dtm.ide.api.extension.IdeAdapter;
 import dtm.ide.api.extension.menu.IdeMenuBuilder;
-import dtm.ide.api.project.editor.DocumentHighlight;
+import dtm.stools.component.panels.editor.code.documenthighlight.DocumentHighlight;
 import dtm.ide.api.project.editor.FormatCodeContext;
 import dtm.ide.api.project.editor.IdeCompletionContext;
 import dtm.ide.api.project.editor.IdeCompletionTriggerKind;
@@ -17,7 +17,6 @@ import dtm.ide.api.project.editor.IdeDiagnosticsContext;
 import dtm.ide.api.project.editor.IdeDocumentHighlightContext;
 import dtm.ide.api.project.editor.IdeDefinitionContext;
 import dtm.ide.api.project.editor.IdeHoverContext;
-import dtm.ide.api.project.editor.IdeFormatScope;
 import dtm.ide.api.project.editor.IdeSignatureHelpContext;
 import dtm.ide.api.project.editor.IdeRenameContext;
 import dtm.ide.api.project.editor.IdeCodeActionContext;
@@ -25,6 +24,8 @@ import dtm.ide.api.project.editor.IdeEditorContext;
 import dtm.ide.api.project.editor.IdeWordClickContext;
 import dtm.ide.api.theme.EditorTheme;
 import dtm.ide.editor.HtmlMarkupCompletionProvider;
+import dtm.ide.editor.BootstrapCompletionProvider;
+import dtm.ide.editor.BootstrapProjectDetector;
 import dtm.ide.editor.theme.WebkitEditorTheme;
 import dtm.ide.lsp.LspServerKind;
 import dtm.ide.lsp.LspStartupCoordinator;
@@ -33,6 +34,11 @@ import dtm.ide.lsp.JsTsSnippets;
 import dtm.ide.navigation.JavaScriptNavigationIndex;
 import dtm.ide.navigation.WebkitNavigationPopup;
 import dtm.ide.ui.NewWebItemPanel;
+import dtm.ide.react.*;
+import dtm.ide.api.extension.runconfig.*;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import dtm.ide.utils.WebkitPathConventions;
 import dtm.request_actions.http.download.core.DownloadObserver;
 import dtm.stools.component.panels.editor.code.autocomplete.AutoCompleteItem;
@@ -90,6 +96,88 @@ public class WebkitAdapter extends IdeAdapter {
     private final AtomicLong projectGeneration = new AtomicLong();
 
 
+    private final BootstrapCompletionProvider bootstrapCompletionProvider = new BootstrapCompletionProvider();
+    private volatile Set<Path> bootstrapRoots = Set.of();
+
+    private final ReactRunSupport reactRunSupport = new ReactRunSupport();
+    private final ScheduledExecutorService reactDetectorExecutor = Executors.newSingleThreadScheduledExecutor(
+            Thread.ofPlatform().daemon(true).name("orion-react-detector").factory());
+    private volatile Set<Path> reactRoots = Set.of();
+    private ScheduledFuture<?> reactDetection;
+
+    private synchronized void startReactDetection(Path root) {
+        if (reactDetection != null) reactDetection.cancel(true);
+        reactRoots = Set.of();
+        bootstrapRoots = Set.of();
+        if (root == null) return;
+        long generation = projectGeneration.get();
+        reactDetection = reactDetectorExecutor.scheduleWithFixedDelay(() -> {
+            try {
+                Set<Path> detected = ReactProjectDetector.find(root.toAbsolutePath().normalize());
+                Set<Path> bootstrapDetected = BootstrapProjectDetector.find(root);
+                SwingUtilities.invokeLater(() -> {
+                    if (generation != projectGeneration.get() || !root.equals(projectPath)) return;
+                    bootstrapRoots = bootstrapDetected;
+                    if (!detected.equals(reactRoots)) {
+                        reactRoots = detected;
+                        requestProjectTreeViewRefresh();
+                    }
+                });
+            } catch (Exception error) {
+                log.debug("Web framework detection failed for {}", root, error);
+            }
+        }, 0, 5, TimeUnit.SECONDS);
+    }
+
+    public boolean isReactProject() {
+        return !reactRoots.isEmpty();
+    }
+
+    @Override
+    public List<RunConfigurationContribution> getRunConfigurationContributions() {
+        return List.of(new ReactRunContribution());
+    }
+
+    @Override
+    public RunProcessHandle launch(RunConfigurationData data, RunExecutionContext context) throws Exception {
+        Path root = context == null ? projectPath : context.getProjectPath();
+        if (root == null) throw new IllegalStateException("Abra um projeto para iniciar o servidor React.");
+        return reactRunSupport.launch(getResource(), data, root);
+    }
+
+    @Override
+    public void stop(RunConfigurationData data) {
+        if (data != null && ReactRunSupport.TYPE.equals(data.getType())) reactRunSupport.stop(data);
+    }
+
+    @Override
+    public void onUnload() {
+        projectGeneration.incrementAndGet();
+        startReactDetection(null);
+        reactDetectorExecutor.shutdownNow();
+        reactRunSupport.stopAll();
+        super.onUnload();
+    }
+
+    private void openReactComponent(Path directory) {
+        NewWebItemPanel panel = new NewWebItemPanel(true);
+        NewWebItemPanel.Result result = createModernComponentDialogBuilder(NewWebItemPanel.Result.class)
+                .title("New React component").confirmText("Create").cancelText("Cancel")
+                .component(panel).result(ctx -> panel.getResult()).show();
+        if (result == null) return;
+        lspSetupExecutor.execute(() -> {
+            try {
+                Path file = ReactScaffold.component(directory, result.name(), result.kind() == NewWebItemPanel.Kind.TSX);
+                SwingUtilities.invokeLater(() -> {
+                    requestProjectTreeViewRefresh();
+                    requestOpenFile(file);
+                });
+            } catch (Exception error) {
+                SwingUtilities.invokeLater(() -> setStatusBarText("Falha ao criar componente: " + error.getMessage()));
+            }
+        });
+    }
+
     private volatile WebkitLspService lspService;
     private volatile Path projectPath;
 
@@ -110,13 +198,20 @@ public class WebkitAdapter extends IdeAdapter {
             projectGeneration.incrementAndGet();
             lspStartupCoordinator.invalidate();
         }
+        boolean changed = !java.util.Objects.equals(this.projectPath, selectedProject);
         this.projectPath = selectedProject;
+        if (changed) {
+            reactRunSupport.stopAll();
+            startReactDetection(selectedProject);
+        }
     }
 
     @Override
     public void onProjectClosed(IdeProjectContext context) {
         long closedGeneration = projectGeneration.incrementAndGet();
         this.projectPath = null;
+        startReactDetection(null);
+        reactRunSupport.stopAll();
         lspStartupCoordinator.invalidate();
         scheduledLspRecoveries.clear();
         editorRegistry.clearProjectEditors();
@@ -149,7 +244,12 @@ public class WebkitAdapter extends IdeAdapter {
         if (selected == null || !Files.isDirectory(selected)) {
             return;
         }
-        menu.into("tree.new", sub -> sub.item("Web file...", newWebItemIcon(), e -> openNewWebItem(selected)));
+        menu.into("tree.new", sub -> {
+            sub.item("Web file...", newWebItemIcon(), e -> openNewWebItem(selected));
+            if (reactRoots.stream().anyMatch(selected.toAbsolutePath().normalize()::startsWith)) {
+                sub.item("React component...", ReactIcons.react(16), e -> openReactComponent(selected));
+            }
+        });
     }
 
     private Icon newWebItemIcon() {
@@ -290,6 +390,8 @@ public class WebkitAdapter extends IdeAdapter {
         if (context == null || !WebkitPathConventions.isHighlightable(context.filePath())) {
             return Collections.emptyList();
         }
+        BootstrapCompletionProvider.Completion bootstrap = bootstrapCompletion(context);
+        if (bootstrap.exclusive()) return bootstrap.items();
         String prefix = completionPrefix(context);
         boolean javascriptContext = isJavaScriptCompletionContext(context);
         List<AutoCompleteItem> pathItems = WebkitPathConventions.isHtmlLike(context.filePath())
@@ -304,6 +406,7 @@ public class WebkitAdapter extends IdeAdapter {
                 ? htmlCompletionProvider.suggestions(context.text(), context.caretOffset(),
                 context.triggerKind() != IdeCompletionTriggerKind.TYPING)
                 : List.of();
+        htmlItems = mergeCompletionItems(bootstrap.items(), htmlItems);
         List<AutoCompleteItem> snippets = javascriptContext ? JsTsSnippets.matching(prefix) : List.of();
         WebkitLspService service = lspService;
         if (service == null) {
@@ -328,6 +431,15 @@ public class WebkitAdapter extends IdeAdapter {
             out.addAll(snippets);
         }
         return out;
+    }
+
+    private BootstrapCompletionProvider.Completion bootstrapCompletion(IdeCompletionContext context) {
+        Path file = WebkitPathConventions.normalizePath(context.filePath());
+        if (file == null || (!bootstrapRoots.stream().anyMatch(file::startsWith)
+                && !BootstrapProjectDetector.hasReference(context.text()))) {
+            return new BootstrapCompletionProvider.Completion(List.of(), false);
+        }
+        return bootstrapCompletionProvider.complete(file, context.text(), context.caretOffset());
     }
 
     private static List<AutoCompleteItem> mergeCompletionItems(List<AutoCompleteItem> first,
@@ -782,6 +894,8 @@ public class WebkitAdapter extends IdeAdapter {
             return false;
         }
         char typed = line.charAt(col - 1);
+        BootstrapCompletionProvider.Completion bootstrap = bootstrapCompletion(context);
+        if (!bootstrap.items().isEmpty()) return true;
         if (WebkitPathConventions.isHtmlLike(context.filePath())) {
             return htmlWantsCompletion(context, typed);
         }
@@ -862,111 +976,13 @@ public class WebkitAdapter extends IdeAdapter {
         if (context == null || context.file() == null || !WebkitPathConventions.isHighlightable(context.file())) {
             return context == null ? null : context.text();
         }
-        String source = context.formatScope() == IdeFormatScope.SELECTION
-                ? context.text()
-                : (context.fullText() == null ? context.text() : context.fullText());
-        int tabSize = Math.max(1, context.tabSize());
-        if (WebkitPathConventions.isHtmlLike(context.file())) {
-            return formatHtml(source, tabSize, context.useSpacesForTab());
+        WebkitLspService service = lspService;
+        if (service == null || !service.isRunningFor(context.file())) {
+            startLanguageServerFor(context.file(), context.fullText() == null ? context.text() : context.fullText());
+            SwingUtilities.invokeLater(() -> setStatusBarText("Preparando o formatador. Tente formatar novamente quando o servidor estiver pronto."));
+            return context.chainedText() == null ? context.text() : context.chainedText();
         }
-        if (WebkitPathConventions.isJsLike(context.file())) {
-            return formatJavaScript(source, tabSize, context.useSpacesForTab());
-        }
-        return source;
-    }
-
-    private static String formatJavaScript(String source, int tabSize, boolean useSpaces) {
-        if (source == null || source.isBlank()) {
-            return source;
-        }
-        String indentUnit = useSpaces ? " ".repeat(tabSize) : "\t";
-        String[] lines = source.replace("\r\n", "\n").replace('\r', '\n').split("\n", -1);
-        StringBuilder formatted = new StringBuilder(source.length());
-        int depth = 0;
-        for (String line : lines) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty()) {
-                formatted.append('\n');
-                continue;
-            }
-            int lineDepth = Math.max(0, depth - leadingClosingBraces(trimmed));
-            formatted.append(indentUnit.repeat(lineDepth)).append(trimmed).append('\n');
-            depth = Math.max(0, depth + braceBalance(trimmed));
-        }
-        return formatted.toString();
-    }
-
-    private static int braceBalance(String text) {
-        int balance = 0;
-        char quote = 0;
-        boolean escaped = false;
-        for (int i = 0; i < text.length(); i++) {
-            char c = text.charAt(i);
-            if (quote != 0) {
-                if (escaped) escaped = false;
-                else if (c == '\\') escaped = true;
-                else if (c == quote) quote = 0;
-                continue;
-            }
-            if (c == '\'' || c == '"' || c == '`') quote = c;
-            else if (c == '{') balance++;
-            else if (c == '}') balance--;
-        }
-        return balance;
-    }
-
-    private static int leadingClosingBraces(String text) {
-        int count = 0;
-        while (count < text.length() && text.charAt(count) == '}') count++;
-        return count;
-    }
-
-    private static String formatHtml(String source, int tabSize, boolean useSpaces) {
-        if (source == null || source.isBlank()) {
-            return source;
-        }
-        String indentUnit = useSpaces ? " ".repeat(tabSize) : "\t";
-        String[] lines = source.replace("\r\n", "\n").replace('\r', '\n').split("\n", -1);
-        StringBuilder formatted = new StringBuilder(source.length());
-        int depth = 0;
-        boolean multilineTag = false;
-        String multilineTagName = "";
-        for (String line : lines) {
-            String trimmed = line.trim();
-            if (trimmed.isEmpty()) {
-                formatted.append('\n');
-                continue;
-            }
-            boolean closing = trimmed.startsWith("</");
-            if (closing) depth = Math.max(0, depth - 1);
-            int lineDepth = multilineTag && !trimmed.equals(">") && !trimmed.endsWith(">") ? depth + 1 : depth;
-            formatted.append(indentUnit.repeat(Math.max(0, lineDepth))).append(trimmed).append('\n');
-
-            if (trimmed.startsWith("<") && !closing && !trimmed.startsWith("<!--")) {
-                String tag = htmlTagName(trimmed);
-                boolean complete = trimmed.endsWith(">") && !trimmed.endsWith("/>");
-                if (complete && !isVoidHtmlTag(tag) && !trimmed.contains("</")) depth++;
-                multilineTag = !trimmed.endsWith(">");
-                if (multilineTag) multilineTagName = tag;
-            }
-            if (multilineTag && trimmed.endsWith(">")) {
-                if (!isVoidHtmlTag(multilineTagName) && !trimmed.endsWith("/>")) depth++;
-                multilineTag = false;
-                multilineTagName = "";
-            }
-        }
-        return formatted.toString();
-    }
-
-    private static String htmlTagName(String value) {
-        int start = value.startsWith("</") ? 2 : (value.startsWith("<") ? 1 : 0);
-        int end = start;
-        while (end < value.length() && (Character.isLetterOrDigit(value.charAt(end)) || value.charAt(end) == '-')) end++;
-        return value.substring(start, end).toLowerCase(java.util.Locale.ROOT);
-    }
-
-    private static boolean isVoidHtmlTag(String tag) {
-        return Set.of("area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr").contains(tag);
+        return service.format(context);
     }
 
     private static boolean insideTag(String text, int offset) {

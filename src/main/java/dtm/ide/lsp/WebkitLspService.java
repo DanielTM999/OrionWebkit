@@ -218,6 +218,19 @@ public class WebkitLspService {
                 .map(p -> p.codeActions(file, text, range)).orElse(List.of());
     }
 
+    public String format(dtm.ide.api.project.editor.FormatCodeContext context) {
+        WebkitFormatting.Document document = WebkitFormatting.document(context);
+        WebkitLspProcess process = kindFor(context.file()).map(processes::get).orElse(null);
+        if (process == null || !process.isRunning()) return document.source();
+        try {
+            return WebkitFormatting.apply(document, process.format(context.file(), document.text(),
+                    document.selection() ? document.range() : null, WebkitFormatting.options(context, document.text())));
+        } catch (IllegalArgumentException error) {
+            log.debug("Formatting edits rejected for {}: {}", context.file(), error.getMessage());
+            return document.source();
+        }
+    }
+
     
 
 

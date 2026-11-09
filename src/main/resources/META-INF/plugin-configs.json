@@ -18,6 +18,13 @@
       "description": "NoName",
       "version": "1.0.0",
       "website": "https://github.com/DanielTM999/DotnetOrionSupport"
+    },
+    {
+      "id": "webkit-react-project-wizard",
+      "name": "React Project Wizard",
+      "description": "Criação de aplicações React com Vite em JavaScript ou TypeScript",
+      "version": "1.0.0",
+      "website": "https://github.com/DanielTM999/OrionWebkit"
     }
   ]
 }
